@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import torch
 
-from nano_llm_infra.ops import rms_norm_reference, rms_norm_shared, rms_norm_warp_shuffle
+from nano_llm_infra.ops.rmsnorm import rms_norm_reference, rms_norm_shared, rms_norm_warp_shuffle
 
 
 def parse_args() -> argparse.Namespace:
