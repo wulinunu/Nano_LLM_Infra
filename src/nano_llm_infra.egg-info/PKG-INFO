@@ -1,3 +1,14 @@
+Metadata-Version: 2.4
+Name: nano-llm-infra
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: torch==2.11.0+cu129
+Requires-Dist: torchvision==0.26.0+cu129
+Requires-Dist: torchaudio==2.11.0+cu129
+Requires-Dist: triton==3.6.0
+
 # Nano-LLM-Infra: 从算子到编译执行的 AI Infra 实战路线图
 
 > **目标**：不追求大而全，旨在通过 5 个核心模块打通 AI Infra 的关键技术闭环：**逻辑推导、高性能实现、图编译执行、量化评估、深度解释**。

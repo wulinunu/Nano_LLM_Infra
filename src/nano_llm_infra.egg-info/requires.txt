@@ -1,0 +1,4 @@
+torch==2.11.0+cu129
+torchvision==0.26.0+cu129
+torchaudio==2.11.0+cu129
+triton==3.6.0

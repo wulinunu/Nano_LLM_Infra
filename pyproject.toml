@@ -5,9 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch",
+    "torch==2.11.0+cu129",
+    "torchvision==0.26.0+cu129",
+    "torchaudio==2.11.0+cu129",
+    "triton==3.6.0"
 ]
 
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+torchaudio = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
 [build-system]
-requires = ["setuptools", "wheel", "torch"]
+requires = ["setuptools", "wheel", "torch==2.11.0+cu129"]
 build-backend = "setuptools.build_meta"
