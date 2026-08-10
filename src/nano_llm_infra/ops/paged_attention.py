@@ -3,41 +3,11 @@ from __future__ import annotations
 import torch
 
 from nano_llm_infra.inference.block_manager import BlockTable, KVCachePool
-from nano_llm_infra.ops.paged_attention_ref import paged_attention_ref
+from nano_llm_infra.ops.pytorch_ref.paged_attention_ref import paged_attention_ref
 
-try:
-    from nano_llm_infra.ops.triton.paged_attention import paged_attention_triton
-except ImportError as exc:  # pragma: no cover - exercised when Triton unavailable
-    _TRITON_BACKEND = None
-    _TRITON_IMPORT_ERROR = exc
-else:
-    _TRITON_BACKEND = paged_attention_triton
-    _TRITON_IMPORT_ERROR = None
+from nano_llm_infra.ops.triton.paged_attention import paged_attention_triton
 
-try:
-    from nano_llm_infra import _paged_attention
-except ImportError as exc:  # pragma: no cover - exercised before extension build
-    _PAGED_ATTENTION_EXT = None
-    _PAGED_ATTENTION_IMPORT_ERROR = exc
-else:
-    _PAGED_ATTENTION_EXT = _paged_attention
-    _PAGED_ATTENTION_IMPORT_ERROR = None
-
-
-def _require_cuda_backend() -> None:
-    if _PAGED_ATTENTION_EXT is None:
-        raise ImportError(
-            "nano_llm_infra._paged_attention is not built. "
-            "Run `python setup.py build_ext --inplace` first."
-        ) from _PAGED_ATTENTION_IMPORT_ERROR
-
-
-def _require_triton_backend() -> None:
-    if _TRITON_BACKEND is None:
-        raise ImportError(
-            "Triton paged attention backend is unavailable. "
-            "Install Triton and verify `src/nano_llm_infra/ops/triton/page_attention.py` imports cleanly."
-        ) from _TRITON_IMPORT_ERROR
+from nano_llm_infra import _paged_attention
 
 
 def _build_decode_inputs(
@@ -82,11 +52,9 @@ def paged_attention(
     if impl == "ref":
         return paged_attention_ref(q, k_cache, v_cache, block_tables, context_lens, block_size).squeeze(0)
     if impl == "triton":
-        _require_triton_backend()
-        return _TRITON_BACKEND(q, k_cache, v_cache, block_tables, context_lens, block_size).squeeze(0)
+        return paged_attention_triton(q, k_cache, v_cache, block_tables, context_lens, block_size).squeeze(0)
     if impl == "cuda":
-        _require_cuda_backend()
-        return _PAGED_ATTENTION_EXT.paged_attention_cuda(
+        return _paged_attention.paged_attention_cuda(
             q, k_cache, v_cache, block_tables, context_lens, int(block_size)
         ).squeeze(0)
     raise ValueError(f"Unsupported paged attention implementation: {impl}")
