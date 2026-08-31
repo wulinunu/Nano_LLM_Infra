@@ -18,7 +18,12 @@ class KernelIR:
         self.stores = []     # SRAM -> HBM 的代码指令
 
     def __repr__(self):
-        return f"KernelIR(name='{self.name}', loads={len(self.loads)}, computes={len(self.computes)}, stores={len(self.stores)})"
+        return (
+            f"KernelIR(name='{self.name}', grid={self.grid}, block_size={self.block_size},\n"
+            f"  loads={self.loads},\n"
+            f"  computes={self.computes},\n"
+            f"  stores={self.stores})"
+        )
 
 
 class LoweringPass:
@@ -34,8 +39,8 @@ class LoweringPass:
                 
             # 确定并发规模
             feature_dim = node.shape[-1] if node.shape else 128
-            block_size = 128
-            grid = f"({feature_dim} + {block_size} - 1) // {block_size}"
+            block_size = 1 << (feature_dim - 1).bit_length()
+            grid = "(num_rows,)"
             
             kernel = KernelIR(node.name, grid, block_size)
             

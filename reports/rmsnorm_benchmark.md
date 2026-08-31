@@ -52,3 +52,32 @@ PYTHONPATH=src python benchmarks/bench_rmsnorm.py
 这次结果说明 Python 到 PyBind，再到自定义 CUDA kernel 的完整调用链路已经跑通。两个 CUDA 版本的最大误差都是 `1.907349e-06`，在当前 `float32` 测试下可以接受。
 
 主要加速来自把 RMSNorm 融合成单个 CUDA kernel，避免 PyTorch reference 中多个 tensor operation 带来的额外 kernel launch 和中间张量读写。`warp shuffle` 版本比 `shared memory` 版本略快，因为它在 warp 内使用寄存器级 shuffle 做规约，减少了 shared memory 访问和同步开销。
+
+# NCU 分析
+
+通过 NVTX 只采集 Warmup 后的 Shared Memory 和 Warp-shuffle 各一次正式执行。
+
+## Duration
+
+| 实现 | Kernel Duration |
+| --- | ---: |
+| Shared Memory | `69.98 us` |
+| Warp-shuffle | `66.05 us` |
+
+Warp-shuffle 比 Shared Memory 版本快约 `1.06x`。NCU 会重放 Kernel 采集硬件计数器，因此这里的绝对耗时高于普通 Benchmark，应主要关注两个 Kernel 之间的相对差异。
+
+## Shared Memory 指标
+
+| 指标 | Warp-shuffle | Shared Memory | 对比 |
+| --- | ---: | ---: | ---: |
+| Shared Load Instructions | `4,608` | `16,896` | 降低 `72.7%` |
+| Shared Store Instructions | `4,608` | `10,752` | 降低 `57.1%` |
+| Shared Instructions Total | `9,216` | `27,648` | 降低 `66.7%` |
+| Shared Wavefronts Total | `37,641` | `117,056` | 降低 `67.8%` |
+| Shared Memory % Peak | `1.88%` | `5.49%` | 降低 `65.8%` |
+| Load/Store Bank Conflicts | `273` | `494` | 降低 `44.7%` |
+
+Warp-shuffle 版本在 Warp 内通过寄存器 Shuffle 完成规约，只在 Warp 之间交换部分和，因此 Shared Memory 指令和 Wavefront 数量都减少约三分之二。这与其更低的延迟一致，说明主要收益来自减少 Shared Memory 访问与同步。
+
+如果只看明确的 Shared Load/Store，冲突数从 `494` 降至 `273`。“Warp-shuffle 的Bank Conflict更低
+

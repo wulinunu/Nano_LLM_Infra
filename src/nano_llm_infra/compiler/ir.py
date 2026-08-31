@@ -75,7 +75,7 @@ class GraphCapturer:
             if 'tensor_meta' in node.meta:
                 meta = node.meta['tensor_meta']
                 # 处理有多个输出的情况，为了简单这里只取第一个
-                if isinstance(meta, tuple): 
+                if not hasattr(meta, 'shape') and isinstance(meta, tuple):
                     meta = meta[0]
                 if hasattr(meta, 'shape'): 
                     shape = tuple(meta.shape)

@@ -1,18 +1,16 @@
-# Nano-LLM-Infra: 从算子到编译执行的 AI Infra 实战路线图
+# Nano-LLM-Infra
 
-> **目标**：不追求大而全，旨在通过 5 个核心模块打通 AI Infra 的关键技术闭环：**逻辑推导、高性能实现、图编译执行、量化评估、深度解释**。
+> **目标**：不追求大而全，旨在通过 5 个核心模块打通 AI Infra 的关键技术闭环
 
 ---
 
 ## 🏗️ 总体架构原则
 * **最小闭环优先 (MVP)**：拒绝过度工程，先跑通主逻辑，再逐步增强性能与抽象层次。
-* **数据驱动优化**：所有优化都必须有 Benchmark 数据支持，不仅要快，还要说清为什么快。
-* **工程规范化**：采用 `uv` + `PyBind11` + `Triton` + `torch.fx` 的现代工业界标准布局。
-* **执行链路完整**：项目目标不是只做单点优化，而是打通 `Graph -> IR/Pass -> Kernel/Runtime -> Benchmark` 的核心链路。
+* **benchmark验证**：所有优化都必须有 Benchmark 数据支持，不仅要快，还要说清为什么快。
 
 ---
 
-## 🛠️ 模块一：CUDA & Triton Kernels（算子性能工程）
+## 🛠️ 模块一：算子性能工程
 **目标**：理解 GPU 访存边界，解决算子融合过程中的显存带宽瓶颈。
 
 ### 1. Fused RMSNorm（核心项）
@@ -21,24 +19,22 @@
 * **DoD**：
     * **正确性**：`torch.allclose` 对比原版，FP16 误差可解释。
     * **性能**：提供 `benchmark/bench_rmsnorm.py`，量化 HBM 读写次数减少带来的 Speedup。
-* **进阶 todo**：
-    - [ ] 实现 Triton 版本并进行对比测试。
-    - [ ] 实现 LayerNorm 版本，分析额外引入的同步与统计开销。
+    * **微观分析 (Micro Profiling)**：使用 `ncu` (Nsight Compute) 证明 Warp-shuffle 版本比 Shared Memory 版本具有更高的 SM 占用率 (Occupancy) 或更低的 Bank Conflict。
 
 ### 2. Mini-FlashAttention（可后置）
 * **核心逻辑**：不物化 $O(T^2)$ 矩阵，实现 Tiling + Online Softmax。
 * **DoD**：
     * **正确性**：输出与 PyTorch reference 对齐。
-    * **性能**：量化不同 `T, D, head_dim` 下的吞吐差异。
+    * **性能 & 自动调优 (Autotuning)**：引入 `@triton.autotune` 自动搜索最优 `BLOCK_M/N` 等参数。
+    * **微观分析 (Micro Profiling)**：使用 `ncu` 采集真实 Memory Throughput，证明相比 Reference 真正消除了 $O(T^2)$ 读写量。
 * **面试考点**：
-    * SRAM 限制
-    * Tiling 逻辑推导
-    * Online Softmax 的数值稳定性
-    * 算子融合的收益分析
+    * SRAM 限制与 Tiling 逻辑推导。
+    * 为什么同一个 Kernel 在不同 Shape 下最优 Grid/Block 组织方式完全不同？(Autotune 的意义)。
+    * Memory Bound (访存瓶颈) vs Compute Bound (计算瓶颈) 的本质区别是什么？Roofline 模型怎么看？
 
 ---
 
-## 🚀 模块二：Nano-vLLM 推理引擎内核 (Inference Engine Core)
+## 🚀 模块二：推理引擎内核 (Inference Engine Core)
 **目标**：剥离分布式与量化的复杂性，用 Python/Triton 最小闭环还原大模型高并发推理的“铁三角”架构（PagedAttention + Continuous Batching + 显存池），攻克显存碎片化与吞吐量瓶颈。
 
 ### 1. 显存块管理器与缓存池 (Block Memory Manager & KV Pool)
@@ -60,6 +56,7 @@
     * 进阶级：使用cuda代码完成PagedAttention Kernel
 * **DoD（完成标准）**：
     * 输出的 Logits 与标准连续内存 Attention 产生的结果在数值上严格对齐（精度误差 < 1e-3）。
+    * **微观分析 (Micro Profiling)**：使用 `ncu` 分析在非连续物理内存寻址时的 L1/L2 Cache Hit Rate 变化与访存带宽代价。
 * **面试考点**：
     * PagedAttention 在硬件（SM、SRAM）层面为什么能大幅提升访存带宽利用率（Memory Bandwidth Utilization）？
     * Triton/CUDA 算子开发中，如何通过 Block Table 进行非连续内存的寻址？
@@ -82,13 +79,17 @@
     * 实现 `Engine.step()`：向调度器索要当前批次（Batch） -> 向内存管理器要物理地址（Block Tables） -> 将数据送入包含 PagedAttention 的极简模型（如迷你 Llama）进行前向传播 -> 采样下一个 Token -> 将新 Token 写入 KV Pool 对应的空闲位。
 * **DoD（完成标准）**：
     * 实现一个流式终端输出：能够同时向 Engine 发送 3 个长度不一的 Prompt，并在终端看到它们不阻塞地、同时一字一字蹦出来。
+    * **宏观分析 (Macro Profiling)**：使用 `torch.profiler` + `nvtx` 对 `Engine.step()` 埋点，抓取 Timeline，能够从 Chrome Trace 图中指出 CPU Launch Overhead 以及 GPU 饿死（Starvation）的时间段。
+* **面试考点**：
+    * CPU 发射延迟 (Launch Overhead) 是什么？如何隐藏它？
+    * 怎样从 Trace 图中判断当前系统是 CPU-bound 还是 GPU-bound？
 
 ### 5. TODO
 * 讲清楚分布式的逻辑，包括如何和ray结合
 
 ---
 
-## 🏋️ 模块三：Training Acceleration（训练加速核心）
+## 🏋️ 模块三：训练加速核心
 **目标**：涵盖工业界大模型训练加速工程师的核心知识点，打通分布式训练核心组件，深刻理解显存墙（Memory Wall）优化与极致的通信计算重叠。
 
 ### 1. Mini DDP Runtime & Comm-Compute Overlap
@@ -98,7 +99,7 @@
 * **DoD**：
     * 单机 2 卡训练跑通，可打印 gradient sync timeline。
     * Benchmark 单卡 vs 双卡 scaling efficiency。
-    * 成功跑通 overlap 逻辑并提供耗时分析。
+    * **宏观分析 (Macro Profiling)**：成功跑通 overlap 逻辑，并使用 `nsys` 抓取 Trace，直观验证 CUDA Stream 中 Compute (计算) 与 NCCL 通信的 Overlap (重叠) 效果。
 * **面试考点**：
     * DDP 为什么比 DataParallel 快？
     * Bucket 是干什么的？Bucket size 如何影响 overlap 效果？
@@ -111,13 +112,29 @@
     * 手写一个极简的 Megatron 风格 TP MLP：`ColumnParallelLinear -> GELU -> RowParallelLinear`，讲清楚权重按哪一维切、输入输出在哪一步做 shard / gather / all-reduce。
 * **DoD**：
     * 单机 2 卡跑通极简 TP MLP block，并验证与 dense reference 对齐。
+    * **宏观分析 (Macro Profiling)**：使用 `nsys` 抓取执行流，可视化 Pipeline Parallelism 中的气泡（Bubble）时间占比，以及 Tensor Parallelism 中 AllReduce 带来的同步阻塞延迟。
 * **面试考点**：
     * **[高频] Megatron 和 DeepSpeed 的核心区别是什么？**（Megatron 主打 3D 并行切计算图，需要侵入修改模型代码；DeepSpeed 主打 ZeRO 切存储，对用户更透明）。
     * 3D 并行中，DP、TP、PP 分别解决什么问题？
     * `ColumnParallelLinear` 和 `RowParallelLinear` 各自的 Forward / Backward 产生了什么通信？
     * 为什么大模型必须用 3D 并行？PP（流水线并行）中的 Bubble（气泡）是什么？如何通过 1F1B 调度来缓解？
 
-### 3. AMP Mixed Precision Engine
+### 3. Expert Parallelism & All-to-All（MoE 通信核心）
+* **核心实现**：
+    * 手写一个最小 MoE 层：`Router -> Token Dispatch -> Local Experts -> Token Combine`。
+    * 将 Expert 分布到不同 Rank，使用 `all_to_all_single()` 完成 Token Dispatch 和结果回传。
+    * 处理每个 Rank 接收 Token 数不同的问题，维护 Split Size 与 Token 原始位置。
+* **DoD**：
+    * 单机 2 卡跑通 EP，并验证输出与单卡 Dense MoE Reference 对齐。
+    * 打印每个 Expert 的 Token 数量，观察负载是否均衡。
+    * 使用 `nsys` 查看两次 All-to-All 的通信耗时，以及通信与 Expert Compute 的执行关系。
+* **面试考点**：
+    * EP 为什么使用 All-to-All，而 TP / DP 主要使用 AllReduce？
+    * MoE 中 Token Dispatch 和 Token Combine 分别在传输什么？
+    * Router 负载不均衡为什么会造成 Straggler？Capacity Factor 和 Auxiliary Loss 如何缓解？
+    * EP 如何与 DP、TP、PP 组合？
+
+### 4. AMP Mixed Precision Engine
 * **核心实现**：实现 `autocast()` 和 `GradScaler()`。覆盖 FP16/BF16 compute、FP32 master weights、dynamic loss scaling。
 * **必须解释**：为什么 AMP 快（Tensor Core 需要 FP16/BF16 tile compute path，不仅是“精度低所以快”）。
 * **DoD**：
@@ -126,7 +143,7 @@
     * Underflow 为什么发生？Scaler 为什么能解决？
     * 为什么大模型训练更偏爱 BF16 而不是 FP16？
 
-### 4. 高级显存优化 (Activation Checkpoint & Memory Pool)
+### 5. 高级显存优化 (Activation Checkpoint & Memory Pool)
 * **核心实现**：基于 `torch.utils.checkpoint`，实现 forward 时不保存 activation，backward 时重新计算 forward。
 * **DoD**：
     * 量化显存下降比例与时间增加比例。
@@ -134,7 +151,7 @@
     * 什么是 Selective Recompute（选择性重计算）？为什么只重算 Attention 的某些部分收益更高？
     * Transformer 的显存峰值通常出现在哪里？
 
-### 5. Mini ZeRO (Stage 1 到 Stage 3 的演进)
+### 6. Mini ZeRO (Stage 1 到 Stage 3 的演进)
 * **核心逻辑**：ZeRO 是 **Data Parallelism (DP) 的极致进化版（数据并行方向的优化）**，它不切分计算图，而是切分了每个 Rank 冗余存储的训练状态（Optimizer States、Gradients、Parameters）。它与 TP/PP 是正交且互补的。
 * **核心实现**：不调用 DeepSpeed API，自己模拟实现 ZeRO-1（切分 Optimizer States）和 ZeRO-3 的核心 Hook（Forward 前 Fetch 参数，算完立刻 Release）。
 * **DoD**：
@@ -148,7 +165,6 @@
 ---
 
 ## 🧠 模块四：Mini AI Compiler（计算图编译核心）
-> 本模块专门强化 **AI Compiler / AI Infra 岗位能力**
 > 构建一个最小但完整的端到端编译链路
 > `Graph -> IR -> Pass (Fusion & Memory) -> Lowering -> Codegen (Triton) -> Run`
 
@@ -158,7 +174,7 @@
     * 构建统一的 Graph IR 节点表示，提取 `OpType`、`Inputs`、`Outputs` 与 Tensor Meta（Shape / Dtype）。
 * **DoD**：
     * 能正确打印、遍历并校验 Graph 的拓扑结构。
-    * 支持将 `torch.fx.Graph` 导出为自定义统一中间表示（Custom IR）。
+    * 支持将 `torch.fx.Graph` 导出为自定义统一中间表示Graph IR。
 * **面试考点**：
     * 为什么 AI 编译器需要 Graph IR？相比 Eager 模式优势是什么？
     * `torch.fx` 捕获的本质是什么？`Tracer`、`Node`、`GraphModule` 的关系是什么？
@@ -170,75 +186,38 @@
     * **Fusion Pass**：实现 `Add + RMSNorm` 或 `MatMul + GELU` 的 Pattern Matching 与节点替换（Rewriting）。
     * **Memory Planning Pass**：对中间张量做生命周期分析（Liveness Analysis），实现可复用 Buffer 的静态内存规划。
 * **DoD**：
-    * 提供融合前后 IR 对比，验证中间张量消除（Intermediate Tensor Elimination）。
+    * 提供融合前后 IR 对比，验证中间张量消除（Intermediate Tensor Elimination）。（减少一次中间张量的显存写和显存读）
     * 输出内存规划报告，证明静态内存分配降低了峰值显存占用。
 * **面试考点**：
     * Pattern Matching 的实现机制：AST 匹配 vs 图拓扑匹配。
     * 为什么算子融合能大幅减少访存开销？它如何优化 Memory Bandwidth Bound 问题？
     * 静态内存分配（Static Buffer Sharing）的算法思路与边界条件是什么？
 
-### 3. Lowering：从 Graph IR 到 Loop/Tile 级表示
+### 3. Lowering：从 Graph IR 到 Kernel IR
 * **核心实现**：
-    * 将高层图算子（Graph-level Op）逐步 Lower 到接近硬件执行的 Loop / Tile 级 IR。
-    * 针对 `MatMul` 或 Elementwise 算子，展示其转换为 Loop Nest（多重循环）与 Tiling（分块）参数的过程。
+    * 将 `Add`、`Fused RMSNorm` 等高层 Graph 节点 Lower 为接近 Triton Kernel 的 `KernelIR`。
+    * `KernelIR` 描述 Kernel 签名、Grid / Block 配置，以及 `Load -> Compute -> Store` 微指令。
 * **DoD**：
-    * 能清晰打印 Lowering 前后的 IR 结构：从高层 Graph Node 降级到带 Block / Grid 映射的 Tile IR。
-    * 给出至少一个算子完整的 Lowering 降级规则映射表。
+    * 能打印 Graph IR 与 Kernel IR，直观看到算子如何转换为访存、计算和写回指令。
+    * Codegen 实际使用 Kernel IR 中的 Grid / Block 信息生成并发配置。
+    * 给出 `Add` 或 `Fused RMSNorm` 的完整 Lowering 映射。
 * **面试考点**：
     * 什么是 Lowering？为什么编译器不一步到位直接从 Graph 到 Code？
-    * Graph IR 与 Loop IR / Tile IR 的职责分工和抽象层级差异是什么？
-    * 映射到硬件（如 GPU Block / Thread）时 Tile Size 怎么选？
+    * Graph IR 与 Kernel IR 的职责分工和抽象层级差异是什么？
+    * Elementwise 算子如何通过 Grid / Block 映射到 GPU 并行执行？
 
 ### 4. Codegen & Dispatch：Triton Kernel 动态生成与运行
 * **核心实现**：
-    * **Codegen**：根据 Lowering 后的 Tile IR，利用 Python 模板或 CodeWriter 动态生成可运行的 Triton Kernel 代码。
+    * **Codegen**：根据 Lowering 后的 Kernel IR，动态组装可运行的 Triton Kernel 代码。
     * **Dispatch & Run**：编译生成出的 Triton 代码，构建 Dispatcher，建立 PyTorch Tensor 到 Triton Kernel 的输入映射并触发执行。
 * **DoD**：
     * 整条 Mini Compiler 链路成功跑通：输入 PyTorch 模型后，依次完成 `捕获 -> 融合/内存优化 -> Lowering -> Triton Codegen -> Dispatch 执行`。
     * 通过 `torch.testing.assert_close` 验证编译后执行结果与 PyTorch Eager 模式数值对齐。
+    * **宏观分析 (Macro Profiling)**：对比 Eager 模式与 Compiled 模式的 `nsys` / `torch.profiler` Trace，量化展示算子融合 (Fusion) 后，Kernel 发射间隙（Gap）的显著消除。
 * **面试考点**：
     * Codegen 与 Dispatch 的区别是什么？
     * 为什么现代 AI 编译器（如 TorchInductor）倾向于生成 Triton / C++ 代码，而不是直接生成机器码？
     * AI 编译器（Compile-time）与运行时（Runtime）的边界在哪里？如何处理 Dynamic Shape？
-
----
-
-## ⚙️ 模块五：Compiler Toolchain & Profiling（工具链与分析）
-**目标**：展示自动化调优、性能归因与端到端分析能力，让项目更接近真实 AI 编译器 / 推理系统工程。
-
-### 1. Kernel Autotuner（自动化调优）
-* **核心实现**：
-    * 针对自定义 CUDA/Triton Kernel 编写自动调优脚本
-    * 扫描 Tile Size、Warp 数量、Block 配置等参数
-* **DoD**：
-    * 提供 `tools/autotune.py`
-    * 支持针对不同输入 Shape 自动选择最优配置
-    * 输出最优配置表与性能对比结果
-* **面试考点**：
-    * 为什么同一个 Kernel 在不同 Shape/GPU 上最优配置不同
-    * Autotune 的搜索空间如何设计
-
-### 2. End-to-End Profiling（端到端性能分析）
-* **核心实现**：
-    * 集成 `nvtx` 标记
-    * 配合自定义 Profiler 采集 Kernel 执行、显存拷贝与 CPU 调度延迟
-* **DoD**：
-    * 导出符合 Chrome Trace 标准的分析文件
-    * 能量化说明端到端加速中，哪些来自计算优化，哪些来自访存优化，哪些来自调度改进
-* **面试考点**：
-    * 如何判断瓶颈在 Kernel、Memory 还是 Runtime
-    * 为什么端到端加速不等于单算子加速
-
-### 3. Compiler Trace Visualization（可选增强项）
-* **核心实现**：
-    * 记录 Graph Capture、Pass、Lowering、Dispatch 各阶段的时间与结果
-    * 输出一份可视化编译日志
-* **DoD**：
-    * 能从输入模型一路追踪到最终执行计划
-    * 支持调试每个 Pass 对 IR 的修改
-* **面试考点**：
-    * 编译器调试为什么困难
-    * IR 可视化对编译器开发的价值是什么
 
 ---
 

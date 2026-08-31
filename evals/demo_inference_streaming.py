@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import torch
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from nano_llm_infra.inference.block_manager import BlockAllocator
 from nano_llm_infra.inference.engine import IterationLevelScheduler, NanoEngine, Sampler
@@ -8,12 +12,18 @@ from nano_llm_infra.inference.TinyTransformerModel import TinyTransformerModel
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true")
+    args = parser.parse_args()
+
     torch.manual_seed(0)
+    torch.set_grad_enabled(False)
     block_size = 4
     allocator = BlockAllocator(num_blocks=8)
     scheduler = IterationLevelScheduler(allocator=allocator, max_batch_size=2)
     model_runner = TinyTransformerModel(
         vocab_size=32,
+        device="cuda",
         hidden_size=16,
         num_layers=1,
         num_heads=2,
@@ -34,23 +44,31 @@ def main() -> None:
     inserted_request = False
 
     step = 0
-    while engine.scheduler.waiting or engine.scheduler.running or engine.scheduler.preempted:
-        stats = engine.step()
-        print(
-            f"step={step:02d} "
-            f"running={stats.running} waiting={stats.waiting} "
-            f"finished={stats.finished} free_blocks={stats.free_blocks} "
-            f"generated={stats.generated}"
-        )
-        if not inserted_request and step == 1:
-            request = engine.add_request([20, 21, 22, 23, 24], max_new_tokens=2)
-            requests.append(request)
-            inserted_request = True
+    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    with profile(activities=activities) if args.profile else torch.no_grad() as prof:
+        while engine.scheduler.waiting or engine.scheduler.running or engine.scheduler.preempted:
+            with record_function(f"Engine.step_{step}"):
+                stats = engine.step()
             print(
-                f"inserted request={request.request_id} "
-                f"prompt={request.prompt_token_ids} max_new_tokens={request.max_new_tokens}"
+                f"step={step:02d} "
+                f"running={stats.running} waiting={stats.waiting} "
+                f"finished={stats.finished} free_blocks={stats.free_blocks} "
+                f"generated={stats.generated}"
             )
-        step += 1
+            if not inserted_request and step == 1:
+                request = engine.add_request([20, 21, 22, 23, 24], max_new_tokens=2)
+                requests.append(request)
+                inserted_request = True
+                print(
+                    f"inserted request={request.request_id} "
+                    f"prompt={request.prompt_token_ids} max_new_tokens={request.max_new_tokens}"
+                )
+            step += 1
+
+    if args.profile:
+        Path("reports/traces").mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace("reports/traces/inference_engine.json")
+        print("\nTrace: reports/traces/inference_engine.json")
 
     print("\nFinal requests:")
     for request in requests:

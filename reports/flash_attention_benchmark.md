@@ -71,5 +71,18 @@ Triton 版本**不完整存储（不物化）中间矩阵**，仅在 SRAM 内维
 - **小 Shape 的优势**：在 `(2,8,128,32)` 时，Triton 取得了 **1.20x** 的加速。此时计算量小，算子融合（省去来回读写显存）带来的红利盖过了循环开销。
 - **大 Shape 的瓶颈**：随着 $D$ 增大，Triton 性能不及 Reference。因为 Reference 命中了底层极致优化的 **cuBLAS** 矩阵乘法。目前的 Mini 版尚未启用 FP16/BF16 和 Tensor Core，且 `BLOCK_M=16` 复用率偏低。
 
+### 4. NCU 硬件指标验证指南
+想要从微观角度验证算子优化带来的实际硬件收益，可以直接使用 Nsight Compute (`ncu`) 对上述 Benchmark 脚本进行采集。
+
+**抓取 FlashAttention 硬件指标：**
+```bash
+PYTHONPATH=src ncu --set full -o reports/ncu_flash_attention -f .venv/bin/python evals/bench_flash_attention.py --seq-lens 256 --head-dims 32 --warmup-ms 10 --rep-ms 10
+```
+*(注：为防止报告过大，抓取 NCU 时只传递了一组 Shape)*
+
+**观察重点**：
+- **Memory Throughput**: 验证 Triton Tiling 版本是否相比 Reference 大幅减少了访存。
+- **SM Workload**: 查看 `tl.dot` 是否充分利用了计算单元。
+
 ### 总结
 本次实现用精简的代码打通了二维 Tiling + Online Softmax 核心算法，**彻底解决了长序列的 $O(T^2)$ 显存爆炸问题**。后续性能优化方向：启用 Tensor Core、扩大 `BLOCK_M`、引入 `num_stages` 软件流水线。

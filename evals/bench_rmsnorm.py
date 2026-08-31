@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=1e-6)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--atol", type=float, default=1e-4)
+    parser.add_argument("--ncu-profile", action="store_true")
     return parser.parse_args()
 
 
@@ -64,6 +65,23 @@ def main() -> None:
 
     check_close("shared", shared, expected, args.rtol, args.atol)
     check_close("warp_shuffle", warp_shuffle, expected, args.rtol, args.atol)
+
+    if args.ncu_profile:
+        for _ in range(args.warmup):
+            rms_norm_shared(x, gamma, args.epsilon)
+            rms_norm_warp_shuffle(x, gamma, args.epsilon)
+        torch.cuda.synchronize()
+
+        with torch.cuda.nvtx.range("rmsnorm_shared"):
+            rms_norm_shared(x, gamma, args.epsilon)
+            torch.cuda.synchronize()
+
+        with torch.cuda.nvtx.range("rmsnorm_warp_shuffle"):
+            rms_norm_warp_shuffle(x, gamma, args.epsilon)
+            torch.cuda.synchronize()
+
+        print("NCU profiling ranges finished.")
+        return
 
     benchmarks: dict[str, Callable[[], torch.Tensor]] = {
         "torch_reference": lambda: rms_norm_reference(x, gamma, args.epsilon),

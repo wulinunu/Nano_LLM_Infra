@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
+from torch.profiler import record_function
 
 from nano_llm_infra.inference.block_manager import (
     BlockAllocationError,
@@ -221,27 +222,32 @@ class NanoEngine:
         return request
 
     def step(self) -> EngineStepStats:
-        batch = self.scheduler.step()
+        with record_function("Scheduler"):
+            batch = self.scheduler.step()
         generated: dict[str, int] = {}
         if batch:
             logits = []
             for request in batch:
                 if request.cached_tokens == 0:
-                    logits.append(self.model_runner.prefill(request, self.kv_cache))
+                    with record_function("Prefill"):
+                        logits.append(self.model_runner.prefill(request, self.kv_cache))
                 else:
-                    logits.append(self.model_runner.decode(request, self.kv_cache))
-            logits = torch.stack(logits, dim=0)
-            token_ids = self.sampler.sample(logits)
-            for request, token_id in zip(batch, token_ids, strict=True):
-                try:
-                    request.block_table.ensure_block_capacity(request.num_tokens + 1, self.allocator)
-                except BlockAllocationError:
-                    self.scheduler.preempt_request(request)
-                    continue
-                request.append_token(token_id)
-                generated[request.request_id] = token_id
-                if request.is_finished:
-                    self.scheduler.finish_request(request)
+                    with record_function("Decode"):
+                        logits.append(self.model_runner.decode(request, self.kv_cache))
+            with record_function("Stack_and_Sample"):
+                logits = torch.stack(logits, dim=0)
+                token_ids = self.sampler.sample(logits)
+            with record_function("Update_Request_State"):
+                for request, token_id in zip(batch, token_ids, strict=True):
+                    try:
+                        request.block_table.ensure_block_capacity(request.num_tokens + 1, self.allocator)
+                    except BlockAllocationError:
+                        self.scheduler.preempt_request(request)
+                        continue
+                    request.append_token(token_id)
+                    generated[request.request_id] = token_id
+                    if request.is_finished:
+                        self.scheduler.finish_request(request)
 
         return EngineStepStats(
             running=len(self.scheduler.running),

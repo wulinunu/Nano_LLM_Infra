@@ -28,7 +28,7 @@ def _flash_attention_kernel(
     offsets_d = tl.arange(0, BLOCK_D)
     valid_m = offsets_m < SEQ_LEN
     mask_d = offsets_d < HEAD_DIM
-    q_ptrs = (
+    q_ptrs = ( #最后是一个[BLOCK_M,BLOCK_D]的矩阵
         Q
         + batch_idx * stride_qb
         + head_idx * stride_qh

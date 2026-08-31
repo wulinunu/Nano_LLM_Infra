@@ -26,9 +26,7 @@ import triton.language as tl
 # ==========================================
 def dispatch_and_run(x, residual, weight, linear_weight, linear_bias=None):
     N = x.shape[-1]
-    B = x.shape[0]
-    BLOCK_SIZE = 128
-    grid = lambda meta: (B, )
+    num_rows = x.numel() // N
 
     # In-place 内存复用逻辑保持不变
     out_add = residual  # <--- In-place 复用
@@ -43,12 +41,13 @@ def dispatch_and_run(x, residual, weight, linear_weight, linear_bias=None):
             
             # 传参映射 (Demo 中简单写死映射关系，真实编译器有一个 Variable Tracker)
             if 'add' in kernel.name and 'fused' not in kernel.name:
-                args = "x, residual, out_add, N, BLOCK_SIZE=BLOCK_SIZE"
+                args = f"x, residual, out_add, N, BLOCK_SIZE={kernel.block_size}"
             elif 'fused_rmsnorm' in kernel.name:
-                args = "out_add, weight, out_norm, N, BLOCK_SIZE=BLOCK_SIZE"
+                args = f"out_add, weight, out_norm, N, BLOCK_SIZE={kernel.block_size}"
             else:
                 args = ""
-                
+
+            code.append(f"    grid = {kernel.grid}")
             code.append(f"    {k_name}[grid]({args})")
             code.append("")
         
