@@ -5,9 +5,8 @@ from .distributed import (
     GradientReducer,
     PipelineRuntime,
     PipelineStage,
-    ZeROWrapper,
     ZeroRuntime,
-    build_pipeline_stage,
+    build_pipeline_stage_model,
     check_tp_mlp,
     shard_dense_mlp_weights_to_tp,
 )
@@ -22,9 +21,8 @@ __all__ = [
     "PipelineStage",
     "RuntimeConfig",
     "TinyTrainingTransformer",
-    "ZeROWrapper",
     "ZeroRuntime",
-    "build_pipeline_stage",
+    "build_pipeline_stage_model",
     "check_tp_mlp",
     "shard_dense_mlp_weights_to_tp",
 ]

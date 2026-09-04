@@ -1,5 +1,5 @@
 from .data_parallel import DataParallelRuntime, GradientBucket, GradientReducer
-from .pipeline_parallel import PipelineRuntime, PipelineStage, build_pipeline_stage
+from .pipeline_parallel import PipelineRuntime, PipelineStage, build_pipeline_stage_model
 from .tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -7,7 +7,7 @@ from .tensor_parallel import (
     check_tp_mlp,
     shard_dense_mlp_weights_to_tp,
 )
-from .zero import ZeROWrapper, ZeroRuntime
+from .zero import ZeroRuntime
 
 __all__ = [
     "ColumnParallelLinear",
@@ -18,9 +18,8 @@ __all__ = [
     "PipelineStage",
     "RowParallelLinear",
     "TPMLP",
-    "ZeROWrapper",
     "ZeroRuntime",
-    "build_pipeline_stage",
+    "build_pipeline_stage_model",
     "check_tp_mlp",
     "shard_dense_mlp_weights_to_tp",
 ]

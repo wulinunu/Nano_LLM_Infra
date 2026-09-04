@@ -3,4 +3,4 @@ __pycache__/
 *.o
 *.pyc
 build/
-.venv/reports/traces/
+reports/traces

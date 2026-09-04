@@ -89,52 +89,45 @@
 
 ---
 
-## 🏋️ 模块三：训练加速核心
-**目标**：涵盖工业界大模型训练加速工程师的核心知识点，打通分布式训练核心组件，深刻理解显存墙（Memory Wall）优化与极致的通信计算重叠。
+## 🏋️ 模块三：分布式训练并行核心 (Distributed Training Parallelism)
+**目标**：全面覆盖工业界大模型训练工程师的核心技能树，从零手写实现当前主流的 6 大并行范式，深刻理解通信拓扑、显存墙优化与并行调度的底层逻辑。
 
-### 1. Mini DDP Runtime & Comm-Compute Overlap
-* **核心实现**：
-    * 自己手写最小 DDP 训练闭环，理解 `autograd hook -> gradient bucketize -> NCCL allreduce -> average gradients`。
-    * 在同一套 DDP runtime 中加入 `async all_reduce()` 与 CUDA stream overlap，展示一个 stream 做 backward 计算，另一个 stream 做通信。
-* **DoD**：
-    * 单机 2 卡训练跑通，可打印 gradient sync timeline。
-    * Benchmark 单卡 vs 双卡 scaling efficiency。
-    * **宏观分析 (Macro Profiling)**：成功跑通 overlap 逻辑，并使用 `nsys` 抓取 Trace，直观验证 CUDA Stream 中 Compute (计算) 与 NCCL 通信的 Overlap (重叠) 效果。
-* **面试考点**：
-    * DDP 为什么比 DataParallel 快？
-    * Bucket 是干什么的？Bucket size 如何影响 overlap 效果？
-    * Allreduce 为什么是训练通信核心？
-    * Overlap 为什么难？如何避免 CUDA Stream 带来的脏读/脏写（Data Hazard）？
+### 1. Data Parallelism (DP) & 通信计算重叠
+* **核心实现**：自己手写最小 DDP 训练闭环，理解 `autograd hook -> gradient bucketize -> NCCL allreduce -> average gradients`。加入 `async all_reduce()` 与 CUDA stream overlap。
+* **DoD**：单机 2 卡训练跑通，`nsys` 直观验证 Compute 与 NCCL 通信的 Overlap。
+* **面试考点**：DDP 为什么比 DataParallel 快？Bucket size 如何影响 Overlap 效果？如何避免 CUDA Stream 的 Data Hazard？
 
-### 2. 3D 并行基础 (Data, Tensor & Pipeline Parallelism)
-* **核心实现**：
-    * 理解大模型必备的 **3D 并行（DP + TP + PP）**。这是 NVIDIA **Megatron-LM** 的核心打法（切分计算图）。
-    * 手写一个极简的 Megatron 风格 TP MLP：`ColumnParallelLinear -> GELU -> RowParallelLinear`，讲清楚权重按哪一维切、输入输出在哪一步做 shard / gather / all-reduce。
-* **DoD**：
-    * 单机 2 卡跑通极简 TP MLP block，并验证与 dense reference 对齐。
-    * **宏观分析 (Macro Profiling)**：使用 `nsys` 抓取执行流，可视化 Pipeline Parallelism 中的气泡（Bubble）时间占比，以及 Tensor Parallelism 中 AllReduce 带来的同步阻塞延迟。
-* **面试考点**：
-    * **[高频] Megatron 和 DeepSpeed 的核心区别是什么？**（Megatron 主打 3D 并行切计算图，需要侵入修改模型代码；DeepSpeed 主打 ZeRO 切存储，对用户更透明）。
-    * 3D 并行中，DP、TP、PP 分别解决什么问题？
-    * `ColumnParallelLinear` 和 `RowParallelLinear` 各自的 Forward / Backward 产生了什么通信？
-    * 为什么大模型必须用 3D 并行？PP（流水线并行）中的 Bubble（气泡）是什么？如何通过 1F1B 调度来缓解？
+### 2. ZeRO (Zero Redundancy Optimizer 1-3)
+* **核心实现**：ZeRO 是 DP 的极致进化，切分冗余存储。不调用 DeepSpeed API，模拟实现 ZeRO-1（切分 Optimizer States）和 ZeRO-3（Forward 前 Fetch 参数，算完立刻 Release）。
+* **DoD**：成功展示参数和状态的切分（Shard），量化 ZeRO-3 相比 Naive DP 在显存峰值上的断崖式下降。
+* **面试考点**：准确写出 ZeRO-1/2/3 显存占用的数学公式；ZeRO-3 中的 All-Gather 时机及与 DDP 通信量的对比。
 
-### 3. Expert Parallelism & All-to-All（MoE 通信核心）
-* **核心实现**：
-    * 手写一个最小 MoE 层：`Router -> Token Dispatch -> Local Experts -> Token Combine`。
-    * 将 Expert 分布到不同 Rank，使用 `all_to_all_single()` 完成 Token Dispatch 和结果回传。
-    * 处理每个 Rank 接收 Token 数不同的问题，维护 Split Size 与 Token 原始位置。
-* **DoD**：
-    * 单机 2 卡跑通 EP，并验证输出与单卡 Dense MoE Reference 对齐。
-    * 打印每个 Expert 的 Token 数量，观察负载是否均衡。
-    * 使用 `nsys` 查看两次 All-to-All 的通信耗时，以及通信与 Expert Compute 的执行关系。
-* **面试考点**：
-    * EP 为什么使用 All-to-All，而 TP / DP 主要使用 AllReduce？
-    * MoE 中 Token Dispatch 和 Token Combine 分别在传输什么？
-    * Router 负载不均衡为什么会造成 Straggler？Capacity Factor 和 Auxiliary Loss 如何缓解？
-    * EP 如何与 DP、TP、PP 组合？
+### 3. Tensor Parallelism (TP)
+* **核心实现**：Megatron-LM 的核心打法（层内计算图切分）。手写极简 TP MLP：`ColumnParallelLinear -> GELU -> RowParallelLinear`，实现切片与 `AllReduce` 通信。
+* **DoD**：单机 2 卡跑通极简 TP，并验证与 Dense Reference 的输出与梯度严格对齐。
+* **面试考点**：`Column` 和 `Row` Linear 的 Forward/Backward 分别产生了什么通信？为什么 TP 通常被限制在单个节点（Node）内？
 
-### 4. AMP Mixed Precision Engine
+### 4. Pipeline Parallelism (PP)
+* **核心实现**：层间切分与流水线调度。实现 Naive、GPipe 以及工业级主流的 **1F1B (One-Forward-One-Backward)** 交错调度。
+* **DoD**：实现 Pipeline Stage 划分，通过 `nsys` Trace 可视化 Pipeline Bubble（气泡），对比 GPipe 与 1F1B 的显存占用差异。
+* **面试考点**：气泡时间占比公式是什么？1F1B 是如何降低峰值显存的（Activation 缓存数量）？
+
+### 5. Expert Parallelism (EP / MoE)
+* **核心实现**：手写最小 MoE 层，将 Experts 分布到不同 Rank。使用 `all_to_all_single()` 完成 Token Dispatch 和 Combine。处理容量因子（Capacity Factor）。
+* **DoD**：单机 2 卡跑通 EP。打印 Expert 负载，使用 `nsys` 查看两次 All-to-All 耗时及与 Expert Compute 的执行关系。
+* **面试考点**：EP 为什么使用 All-to-All 而不是 AllReduce？Router 负载不均为什么会造成 Straggler？
+
+### 6. Context Parallelism (CP / 序列并行)
+* **核心实现**：针对无限长上下文（Long Context）的终极解法。手写极简的基于环形通信（Ring Attention）或 DeepSpeed Ulysses 风格的序列切片注意力机制。
+* **DoD**：跑通原本在单卡会发生 OOM 的长序列 Attention（如 128k），验证 P2P Send/Recv 或 All-to-All 在序列维度上的通信正确性。
+* **面试考点**：Megatron 的 Sequence Parallelism (SP) 与 Context Parallelism (Ring/Ulysses) 的本质区别是什么？如何打破单卡 KVCache 显存墙？
+
+### 7. Multi-Dimensional Parallelism (混合并行拓扑)
+* **核心实现**：理论与通信网格构建。构建一个 3D/4D 分布式 Process Group 通信网格（Mesh），正确定义和获取 `tp_group`, `pp_group`, `dp_group`。
+* **DoD**：正确初始化一个包含多维度的 Distributed Mesh，打印各个 Rank 所属的不同子通信组。
+* **面试考点**：在真实集群（如千卡 A100/H100, NVSwitch + IB 网络）中，TP、EP、PP、DP 分别应该映射到什么物理拓扑上？为什么？
+
+### 8. AMP Mixed Precision Engine
 * **核心实现**：实现 `autocast()` 和 `GradScaler()`。覆盖 FP16/BF16 compute、FP32 master weights、dynamic loss scaling。
 * **必须解释**：为什么 AMP 快（Tensor Core 需要 FP16/BF16 tile compute path，不仅是“精度低所以快”）。
 * **DoD**：
@@ -143,24 +136,13 @@
     * Underflow 为什么发生？Scaler 为什么能解决？
     * 为什么大模型训练更偏爱 BF16 而不是 FP16？
 
-### 5. 高级显存优化 (Activation Checkpoint & Memory Pool)
+### 9. 高级显存优化 (Activation Checkpoint & Memory Pool)
 * **核心实现**：基于 `torch.utils.checkpoint`，实现 forward 时不保存 activation，backward 时重新计算 forward。
 * **DoD**：
     * 量化显存下降比例与时间增加比例。
 * **面试考点**：
     * 什么是 Selective Recompute（选择性重计算）？为什么只重算 Attention 的某些部分收益更高？
     * Transformer 的显存峰值通常出现在哪里？
-
-### 6. Mini ZeRO (Stage 1 到 Stage 3 的演进)
-* **核心逻辑**：ZeRO 是 **Data Parallelism (DP) 的极致进化版（数据并行方向的优化）**，它不切分计算图，而是切分了每个 Rank 冗余存储的训练状态（Optimizer States、Gradients、Parameters）。它与 TP/PP 是正交且互补的。
-* **核心实现**：不调用 DeepSpeed API，自己模拟实现 ZeRO-1（切分 Optimizer States）和 ZeRO-3 的核心 Hook（Forward 前 Fetch 参数，算完立刻 Release）。
-* **DoD**：
-    * 成功展示 optimizer state shard partition。
-    * 模拟 ZeRO-3 的参数即时获取与释放机制。
-* **面试考点**：
-    * ZeRO 和 3D 并行（TP/PP）的区别是什么？（ZeRO 仍是 DP，所有卡最终都会算完一遍完整的前向和反向，只是不在显存里一直存着所有参数）。
-    * 面试极强加分：准确写出 ZeRO-1/2/3 显存占用的数学公式。
-    * ZeRO-3 中的 All-Gather 发生在什么时机？通信量和 DDP 相比有什么变化？
 
 ---
 

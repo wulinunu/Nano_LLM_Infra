@@ -9,8 +9,6 @@ from nano_llm_infra.training.model import TinyTrainingTransformer
 from nano_llm_infra.training.parallel_state import (
     get_pipeline_model_parallel_global_ranks,
     get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
 )
 
 
@@ -30,10 +28,10 @@ class PipelineStage(nn.Module):
         self.norm = norm
         self.lm_head = lm_head
 
-    def forward_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
         if self.embedding is None:
             raise RuntimeError("only the first pipeline stage accepts token ids")
-        return self.forward_hidden(self.embedding(token_ids))
+        return self.embedding(token_ids)
 
     def forward_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
@@ -45,24 +43,24 @@ class PipelineStage(nn.Module):
         return hidden
 
 
-def build_pipeline_stage(model: TinyTrainingTransformer) -> PipelineStage:
+def build_pipeline_stage_model(model: TinyTrainingTransformer) -> PipelineStage:
     """从完整模型中取出当前 PP rank 应持有的连续 Block。"""
-    pp_rank = get_pipeline_model_parallel_rank()
-    pp_world_size = get_pipeline_model_parallel_world_size()
+    global_ranks = get_pipeline_model_parallel_global_ranks()
+    pp_rank = global_ranks.index(dist.get_rank())
+    pp_world_size = len(global_ranks)
     if len(model.blocks) % pp_world_size != 0:
-        raise ValueError("num_layers must be divisible by pipeline parallel size")
+        raise ValueError("num_layers must be divisible by pipeline parallel size")  # 均分简化
 
+    # 确定当前stage起始结束的位置
     blocks_per_stage = len(model.blocks) // pp_world_size
     start = pp_rank * blocks_per_stage
     end = start + blocks_per_stage
-    is_first_stage = pp_rank == 0
-    is_last_stage = pp_rank == pp_world_size - 1
 
     return PipelineStage(
-        embedding=model.embedding if is_first_stage else None,
+        embedding=model.embedding if pp_rank == 0 else None,
         blocks=list(model.blocks[start:end]),
-        norm=model.norm if is_last_stage else None,
-        lm_head=model.lm_head if is_last_stage else None,
+        norm=model.norm if pp_rank == pp_world_size - 1 else None,
+        lm_head=model.lm_head if pp_rank == pp_world_size - 1 else None,
     )
 
 
@@ -78,9 +76,9 @@ class PipelineRuntime:
     def __init__(self, stage: PipelineStage) -> None:
         self.stage = stage
         self.group = get_pipeline_model_parallel_group()
-        self.rank = get_pipeline_model_parallel_rank()
-        self.world_size = get_pipeline_model_parallel_world_size()
         self.global_ranks = get_pipeline_model_parallel_global_ranks()
+        self.rank = self.global_ranks.index(dist.get_rank())
+        self.world_size = len(self.global_ranks)
         self.input_hiddens: dict[int, torch.Tensor] = {}
         self.output_hiddens: dict[int, torch.Tensor] = {}
         self.logits: dict[int, torch.Tensor] = {}
@@ -113,20 +111,21 @@ class PipelineRuntime:
         hidden_shape: tuple[int, int, int],
         device: torch.device,
     ) -> None:
-        if self.is_first_stage:
+        if self.is_first_stage: # 第一层不需要接 
             if token_ids is None:
                 raise ValueError("the first pipeline stage needs token ids")
-            hidden = self.stage.forward_tokens(token_ids)
-        else:
+            hidden = self.stage.forward_embedding(token_ids)
+            hidden = self.stage.forward_hidden(hidden)
+        else: #接激活值并计算
             hidden = torch.empty(hidden_shape, device=device)
-            dist.recv(hidden, src=self._previous_global_rank(), group=self.group)
-            self.input_hiddens[mb_id] = hidden.requires_grad_()
+            dist.recv(hidden, src=self._previous_global_rank(), group=self.group) #成对的resv和send 谁先执行到 就阻塞等对方
+            self.input_hiddens[mb_id] = hidden.requires_grad_() # 输入的tensor需要梯度 才能回传。存入self.input_hiddens因为有多个micro-batch
             hidden = self.stage.forward_hidden(self.input_hiddens[mb_id])
 
         if self.is_last_stage:
             self.logits[mb_id] = hidden
-        else:
-            self.output_hiddens[mb_id] = hidden
+        else: #不是最后一层都需要传
+            self.output_hiddens[mb_id] = hidden # 正向保存
             dist.send(hidden.detach(), dst=self._next_global_rank(), group=self.group)
 
         self.timeline.append(f"F{mb_id}")
@@ -138,7 +137,7 @@ class PipelineRuntime:
         num_microbatches: int,
     ) -> torch.Tensor | None:
         loss = None
-        if self.is_last_stage:
+        if self.is_last_stage: # 最后一个不需要接只需要传
             if token_ids is None or mb_id not in self.logits:
                 raise ValueError("last stage needs token ids and stored logits")
             logits = self.logits.pop(mb_id)
@@ -153,11 +152,13 @@ class PipelineRuntime:
             self.timeline.append(f"B{mb_id}")
             return loss.detach()
 
+        # 接梯度并回传
         output_hidden = self.output_hiddens.pop(mb_id)
         output_grad = torch.empty_like(output_hidden)
         dist.recv(output_grad, src=self._next_global_rank(), group=self.group)
         output_hidden.backward(output_grad)
 
+        # 传 第一个不需要传
         if not self.is_first_stage:
             grad = self.input_hiddens.pop(mb_id).grad
             dist.send(grad, dst=self._previous_global_rank(), group=self.group)
@@ -175,7 +176,7 @@ class PipelineRuntime:
         self._reset_state()
         num_microbatches = len(micro_batches)
         last_loss = None
-        for mb_id, tokens in enumerate(micro_batches):
+        for mb_id, tokens in enumerate(micro_batches): # 同样的批次 不同stage拿到同样的token
             tokens_f = tokens if self.is_first_stage else None
             self.forward_microbatch(mb_id, tokens_f, hidden_shape, device)
             tokens_b = tokens if self.is_last_stage else None

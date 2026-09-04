@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -20,7 +19,7 @@ class GradientBucket:
     offsets: list[tuple[int, int]]
     buffer: torch.Tensor
     ready_count: int = 0
-    work: object | None = None
+    allreduce_handle: object | None = None
     done_event: torch.cuda.Event | None = None
 
 
@@ -38,18 +37,20 @@ class GradientReducer:
         self.world_size = dist.get_world_size(group=self.group)
         self.comm_stream = torch.cuda.Stream(device=self.device)
         self.buckets = self._build_buckets(bucket_size_mb)
+        self.param_locations = {}
         self.hooks = []
         self.timeline: list[str] = []
 
         for bucket_index, bucket in enumerate(self.buckets):
-            for parameter_index, parameter in enumerate(bucket.parameters):
-                hook = partial(self._on_gradient_ready, bucket_index, parameter_index)
-                self.hooks.append(parameter.register_hook(hook))
+            for parameter_index_in_bucket, parameter in enumerate(bucket.parameters):
+                self.param_locations[parameter] = (bucket_index, parameter_index_in_bucket)
+                self.hooks.append(parameter.register_post_accumulate_grad_hook(self._copy_grad_to_bucket))
 
+    # 将所有参数按照固定的桶大小分桶
     def _build_buckets(self, bucket_size_mb: float) -> list[GradientBucket]:
         max_bytes = max(1, int(bucket_size_mb * 1024 * 1024))
         buckets: list[GradientBucket] = []
-        parameters: list[nn.Parameter] = []
+        parameters: list[nn.Parameter] = [] # 当前正在装的桶中已经放进去的参数列表
         current_bytes = 0
         for parameter in self.parameters:
             parameter_bytes = parameter.numel() * parameter.element_size()
@@ -63,51 +64,49 @@ class GradientReducer:
         return buckets
 
     def _make_bucket(self, parameters: list[nn.Parameter]) -> GradientBucket:
-        offsets: list[tuple[int, int]] = []
-        offset = 0
+        offsets_in_buffer: list[tuple[int, int]] = []
+        offset_in_buffer = 0
         for parameter in parameters:
-            next_offset = offset + parameter.numel()
-            offsets.append((offset, next_offset))
-            offset = next_offset
-        buffer = torch.empty(offset, device=self.device, dtype=parameters[0].dtype)
-        return GradientBucket(parameters, offsets, buffer)
+            next_offset = offset_in_buffer + parameter.numel()
+            offsets_in_buffer.append((offset_in_buffer, next_offset))
+            offset_in_buffer = next_offset
+        buffer = torch.empty(offset_in_buffer, device=self.device, dtype=parameters[0].dtype)
+        return GradientBucket(parameters, offsets_in_buffer, buffer)
 
+    # 每个step之前重置
     def begin_backward(self) -> None:
         self.timeline.clear()
         for bucket in self.buckets:
             bucket.ready_count = 0
-            bucket.work = None
+            bucket.allreduce_handle = None
             bucket.done_event = None
 
-    def _on_gradient_ready(
-        self,
-        bucket_index: int,
-        parameter_index: int,
-        gradient: torch.Tensor,
-    ) -> torch.Tensor:
+    # hook核心函数
+    def _copy_grad_to_bucket(self, parameter: nn.Parameter) -> None:
+        bucket_index, parameter_index_in_bucket = self.param_locations[parameter]
         bucket = self.buckets[bucket_index]
-        start, end = bucket.offsets[parameter_index]
-        bucket.buffer[start:end].copy_(gradient.reshape(-1))
+        start, end = bucket.offsets[parameter_index_in_bucket]
+        bucket.buffer[start:end].copy_(parameter.grad.reshape(-1))
         bucket.ready_count += 1
         if bucket.ready_count == len(bucket.parameters):
             ready_event = torch.cuda.Event()
             torch.cuda.current_stream(self.device).record_event(ready_event)
             with torch.cuda.stream(self.comm_stream):
                 self.comm_stream.wait_event(ready_event)
-                bucket.work = dist.all_reduce(bucket.buffer, group=self.group, async_op=True)
+                bucket.allreduce_handle = dist.all_reduce(bucket.buffer, group=self.group, async_op=True) #这里只是求和
                 bucket.done_event = torch.cuda.Event()
                 bucket.done_event.record(self.comm_stream)
             self.timeline.append(f"bucket {bucket_index}: async all_reduce launched")
-        return gradient
 
     def finish_gradient_sync(self) -> None:
         current_stream = torch.cuda.current_stream(self.device)
         for bucket_index, bucket in enumerate(self.buckets):
-            if bucket.work is None or bucket.done_event is None:
+            if bucket.allreduce_handle is None or bucket.done_event is None:
                 raise RuntimeError(f"bucket {bucket_index} did not receive every gradient")
-            bucket.work.wait()
+            bucket.allreduce_handle.wait()
             current_stream.wait_event(bucket.done_event)
-            bucket.buffer.div_(self.world_size)
+            bucket.buffer.div_(self.world_size) #这里求平均
+            # 写回梯度
             for parameter, (start, end) in zip(bucket.parameters, bucket.offsets, strict=True):
                 parameter.grad = bucket.buffer[start:end].view_as(parameter).clone()
             self.timeline.append(f"bucket {bucket_index}: gradient average finished")
@@ -134,20 +133,26 @@ class DataParallelRuntime:
         self.gradient_reducer = gradient_reducer
 
     def train_step(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # 清梯度
         self.optimizer.zero_grad(set_to_none=True)
+        # 重置bucket
         if self.gradient_reducer is not None:
             self.gradient_reducer.begin_backward()
 
         with self.amp.autocast():
+            # 前向
             logits = self.model(token_ids)
             loss = F.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.size(-1)),
                 token_ids[:, 1:].reshape(-1),
             )
 
+        # 开始反向，本卡局部梯度写进param.grad之后触发hook函数
         self.amp.backward(loss)
+        #  wait 通信、把梯度除以 world_size（求平均），再写回 param.grad
         if self.gradient_reducer is not None:
             self.gradient_reducer.finish_gradient_sync()
+        # 更新
         self.amp.step(self.optimizer)
         return loss.detach()
 

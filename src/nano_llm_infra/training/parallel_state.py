@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from itertools import product
+
+import torch
 import torch.distributed as dist
 
 # ---------------------------------------------------------------------------- #
@@ -8,25 +11,25 @@ import torch.distributed as dist
 
 _TENSOR_MODEL_PARALLEL_GROUP = None
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+_CONTEXT_PARALLEL_GROUP = None
+_EXPERT_MODEL_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP = None
 
-_TP_WORLD_SIZE = 1
-_PP_WORLD_SIZE = 1
-_DP_WORLD_SIZE = 1
 _PP_GLOBAL_RANKS: list[int] = []
+_CP_GLOBAL_RANKS: list[int] = []
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
 ) -> None:
     """
-    初始化正交的 TP、PP、DP 通信组。
+    初始化正交的 DP、PP、CP、EP、TP 通信组。
 
-    Rank 布局为 ``[dp][pp][tp]``。例如 DP=2、PP=2、TP=2 时：
-    - TP group: [0, 1]、[2, 3]、[4, 5]、[6, 7]
-    - PP group: [0, 2]、[1, 3]、[4, 6]、[5, 7]
-    - DP group: [0, 4]、[1, 5]、[2, 6]、[3, 7]
+    Rank 布局为 ``[dp][pp][cp][ep][tp]``，TP 是变化最快的维度。
+    当前 demo 只单独运行一种模型并行，但通信组可以表达五维组合。
     """
     if not dist.is_initialized():
         raise RuntimeError("Call dist.init_process_group() before initializing parallel groups.")
@@ -36,63 +39,90 @@ def initialize_model_parallel(
 
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _CONTEXT_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP
-    global _TP_WORLD_SIZE
-    global _PP_WORLD_SIZE
-    global _DP_WORLD_SIZE
     global _PP_GLOBAL_RANKS
+    global _CP_GLOBAL_RANKS
 
-    # 确保总卡数能被切分方式整除
-    if world_size % (tensor_model_parallel_size * pipeline_model_parallel_size) != 0:
+    model_parallel_size = (
+        tensor_model_parallel_size
+        * pipeline_model_parallel_size
+        * context_parallel_size
+        * expert_model_parallel_size
+    )
+    if world_size % model_parallel_size != 0:
         raise RuntimeError(
-            f"world_size ({world_size}) is not divisible by tensor_parallel_size "
-            f"({tensor_model_parallel_size}) x pipeline_parallel_size ({pipeline_model_parallel_size})"
+            f"world_size ({world_size}) is not divisible by PP x CP x EP x TP "
+            f"({pipeline_model_parallel_size} x {context_parallel_size} x "
+            f"{expert_model_parallel_size} x {tensor_model_parallel_size})"
         )
 
-    data_parallel_size = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
+    data_parallel_size = world_size // model_parallel_size
+    rank_grid = torch.arange(world_size).reshape(
+        data_parallel_size,
+        pipeline_model_parallel_size,
+        context_parallel_size,
+        expert_model_parallel_size,
+        tensor_model_parallel_size,
+    )
 
-    _TP_WORLD_SIZE = tensor_model_parallel_size
-    _PP_WORLD_SIZE = pipeline_model_parallel_size
-    _DP_WORLD_SIZE = data_parallel_size
+    for dp_rank, pp_rank, cp_rank, ep_rank in product(
+        range(data_parallel_size),
+        range(pipeline_model_parallel_size),
+        range(context_parallel_size),
+        range(expert_model_parallel_size),
+    ):
+        ranks = rank_grid[dp_rank, pp_rank, cp_rank, ep_rank, :].tolist()
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            _TENSOR_MODEL_PARALLEL_GROUP = group
 
-    for dp_rank in range(data_parallel_size):
-        for pp_rank in range(pipeline_model_parallel_size):
-            base = (dp_rank * pipeline_model_parallel_size + pp_rank) * tensor_model_parallel_size
-            ranks = list(range(base, base + tensor_model_parallel_size))
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                _TENSOR_MODEL_PARALLEL_GROUP = group
+    for dp_rank, pp_rank, cp_rank, tp_rank in product(
+        range(data_parallel_size),
+        range(pipeline_model_parallel_size),
+        range(context_parallel_size),
+        range(tensor_model_parallel_size),
+    ):
+        ranks = rank_grid[dp_rank, pp_rank, cp_rank, :, tp_rank].tolist()
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            _EXPERT_MODEL_PARALLEL_GROUP = group
 
-    for dp_rank in range(data_parallel_size):
-        for tp_rank in range(tensor_model_parallel_size):
-            ranks = [
-                (dp_rank * pipeline_model_parallel_size + pp_rank)
-                * tensor_model_parallel_size
-                + tp_rank
-                for pp_rank in range(pipeline_model_parallel_size)
-            ]
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                _PIPELINE_MODEL_PARALLEL_GROUP = group
-                _PP_GLOBAL_RANKS = ranks #因为pp需要指定前后顺序
+    for dp_rank, pp_rank, ep_rank, tp_rank in product(
+        range(data_parallel_size),
+        range(pipeline_model_parallel_size),
+        range(expert_model_parallel_size),
+        range(tensor_model_parallel_size),
+    ):
+        ranks = rank_grid[dp_rank, pp_rank, :, ep_rank, tp_rank].tolist()
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            _CONTEXT_PARALLEL_GROUP = group
+            _CP_GLOBAL_RANKS = ranks
 
-    for pp_rank in range(pipeline_model_parallel_size):
-        for tp_rank in range(tensor_model_parallel_size):
-            ranks = [
-                (dp_rank * pipeline_model_parallel_size + pp_rank)
-                * tensor_model_parallel_size
-                + tp_rank
-                for dp_rank in range(data_parallel_size)
-            ]
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                _DATA_PARALLEL_GROUP = group
+    for dp_rank, cp_rank, ep_rank, tp_rank in product(
+        range(data_parallel_size),
+        range(context_parallel_size),
+        range(expert_model_parallel_size),
+        range(tensor_model_parallel_size),
+    ):
+        ranks = rank_grid[dp_rank, :, cp_rank, ep_rank, tp_rank].tolist()
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            _PIPELINE_MODEL_PARALLEL_GROUP = group
+            _PP_GLOBAL_RANKS = ranks
 
-
-def get_tensor_model_parallel_group():
-    """获取当前进程所在的 TP 组。"""
-    assert _TENSOR_MODEL_PARALLEL_GROUP is not None, "tensor model parallel group is not initialized"
-    return _TENSOR_MODEL_PARALLEL_GROUP
+    for pp_rank, cp_rank, ep_rank, tp_rank in product(
+        range(pipeline_model_parallel_size),
+        range(context_parallel_size),
+        range(expert_model_parallel_size),
+        range(tensor_model_parallel_size),
+    ):
+        ranks = rank_grid[:, pp_rank, cp_rank, ep_rank, tp_rank].tolist()
+        group = dist.new_group(ranks)
+        if rank in ranks:
+            _DATA_PARALLEL_GROUP = group
 
 
 def get_data_parallel_group():
@@ -101,41 +131,37 @@ def get_data_parallel_group():
     return _DATA_PARALLEL_GROUP
 
 
-def get_data_parallel_rank() -> int:
-    if _DP_WORLD_SIZE == 1:
-        return 0
-    return dist.get_rank(group=get_data_parallel_group())
-
-
-def get_data_parallel_world_size() -> int:
-    return _DP_WORLD_SIZE
-
-
 def get_pipeline_model_parallel_group():
+    """当前进程所在的 PP 通信组。"""
     assert _PIPELINE_MODEL_PARALLEL_GROUP is not None, "pipeline model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_pipeline_model_parallel_rank() -> int:
-    if _PP_WORLD_SIZE == 1:
-        return 0
-    return dist.get_rank(group=get_pipeline_model_parallel_group())
-
-
-def get_pipeline_model_parallel_world_size() -> int:
-    return _PP_WORLD_SIZE
-
-
-# dist.send/resv明确要求指定src/dst 所以必须要有global rank
 def get_pipeline_model_parallel_global_ranks() -> list[int]:
+    """这条流水线各 stage 的全局 rank，按前后顺序排列。"""
+    assert _PP_GLOBAL_RANKS, "pipeline model parallel group is not initialized"
     return _PP_GLOBAL_RANKS
 
 
-def get_tensor_model_parallel_world_size():
-    return _TP_WORLD_SIZE
+def get_context_parallel_group():
+    """获取当前进程所在的 CP 组。"""
+    assert _CONTEXT_PARALLEL_GROUP is not None, "context parallel group is not initialized"
+    return _CONTEXT_PARALLEL_GROUP
 
 
-def get_tensor_model_parallel_rank():
-    if _TP_WORLD_SIZE == 1:
-        return 0
-    return dist.get_rank(group=get_tensor_model_parallel_group())
+def get_context_parallel_global_ranks() -> list[int]:
+    """当前 CP 环中各进程的全局 rank，按序列分片顺序排列。"""
+    assert _CP_GLOBAL_RANKS, "context parallel group is not initialized"
+    return _CP_GLOBAL_RANKS
+
+
+def get_expert_model_parallel_group():
+    """获取当前进程所在的 EP 组。"""
+    assert _EXPERT_MODEL_PARALLEL_GROUP is not None, "expert parallel group is not initialized"
+    return _EXPERT_MODEL_PARALLEL_GROUP
+
+
+def get_tensor_model_parallel_group():
+    """获取当前进程所在的 TP 组。"""
+    assert _TENSOR_MODEL_PARALLEL_GROUP is not None, "tensor model parallel group is not initialized"
+    return _TENSOR_MODEL_PARALLEL_GROUP
