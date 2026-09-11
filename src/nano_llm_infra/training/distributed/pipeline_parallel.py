@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-from nano_llm_infra.training.model import TinyTrainingTransformer
+from nano_llm_infra.models.tiny_transformer import TinyTransformerModel
 from nano_llm_infra.training.parallel_state import (
     get_pipeline_model_parallel_global_ranks,
     get_pipeline_model_parallel_group,
@@ -43,7 +43,7 @@ class PipelineStage(nn.Module):
         return hidden
 
 
-def build_pipeline_stage_model(model: TinyTrainingTransformer) -> PipelineStage:
+def build_pipeline_stage_model(model: TinyTransformerModel) -> PipelineStage:
     """从完整模型中取出当前 PP rank 应持有的连续 Block。"""
     global_ranks = get_pipeline_model_parallel_global_ranks()
     pp_rank = global_ranks.index(dist.get_rank())

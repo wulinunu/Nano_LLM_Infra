@@ -43,6 +43,13 @@ async def run_benchmarks(
     prompts: list[Prompt],
 ) -> None:
     metrics = await controller.run_step(prompts)
+    print(
+        f"[flow] kv_pool={metrics.kv_pool_mb:.2f}MB "
+        f"peak_blocks={metrics.kv_blocks_peak} "
+        f"kv_released={metrics.released_memory_mb:.2f}MB "
+        f"zero2_memory={metrics.zero_backward_memory_mb:.1f}MB "
+        f"version={metrics.policy_version}"
+    )
     colocated_ms = (
         metrics.rollout_ms + metrics.reward_ms + metrics.train_ms + metrics.sync_ms
     )
@@ -103,6 +110,9 @@ async def run(args: argparse.Namespace) -> None:
     config = RLConfig(
         group_size=args.group_size,
         response_length=args.response_length,
+        kv_num_blocks=args.kv_num_blocks,
+        rollout_batch_size=args.rollout_batch_size,
+        zero_bucket_size_mb=args.zero_bucket_size_mb,
     )
     pool = ResourcePool(args.num_workers, config)
     worker_group = WorkerGroup(pool)
@@ -126,10 +136,16 @@ async def run(args: argparse.Namespace) -> None:
                 f"version={metrics.policy_version} reward={metrics.mean_reward:.3f} "
                 f"loss={metrics.loss:.4f} kl={metrics.kl:.5f} "
                 f"grad_norm={metrics.grad_norm:.4f} "
-                f"rollout={metrics.rollout_ms:.1f}ms "
-                f"reward_time={metrics.reward_ms:.1f}ms "
-                f"train={metrics.train_ms:.1f}ms sync={metrics.sync_ms:.1f}ms "
-                f"memory={metrics.gpu_memory_mb:.1f}MB"
+                f"memory={metrics.gpu_memory_mb:.1f}MB\n"
+                f"  KV allocate: pool={metrics.kv_pool_mb:.2f}MB "
+                f"allocated={metrics.rollout_memory_mb:.1f}MB\n"
+                f"  Continuous rollout: {metrics.rollout_ms:.1f}ms "
+                f"peak_blocks={metrics.kv_blocks_peak}\n"
+                f"  KV release: {metrics.released_memory_mb:.2f}MB\n"
+                f"  Reward: {metrics.reward_ms:.1f}ms\n"
+                f"  ZeRO-2 train: {metrics.train_ms:.1f}ms "
+                f"backward_memory={metrics.zero_backward_memory_mb:.1f}MB\n"
+                f"  Weight sync: {metrics.sync_ms:.1f}ms"
             )
     finally:
         reward_executor.close()
@@ -143,6 +159,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--response-length", type=int, default=8)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--kv-num-blocks", type=int, default=256)
+    parser.add_argument("--rollout-batch-size", type=int, default=16)
+    parser.add_argument("--zero-bucket-size-mb", type=float, default=0.05)
     parser.add_argument("--benchmark", action="store_true")
     return parser.parse_args()
 

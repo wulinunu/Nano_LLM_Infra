@@ -13,7 +13,7 @@ from nano_llm_infra.inference.block_manager import (
     BlockTable,
     KVCachePool,
 )
-from nano_llm_infra.inference.TinyTransformerModel import TinyTransformerModel
+from nano_llm_infra.models.tiny_transformer import TinyTransformerModel
 
 
 class RequestStatus(str, Enum):
@@ -30,6 +30,7 @@ class Request:
     max_new_tokens: int
     status: RequestStatus = RequestStatus.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
+    generated_logprobs: list[float] = field(default_factory=list)
     cached_tokens: int = 0
     block_table: BlockTable | None = field(default=None, init=False)
 
@@ -51,10 +52,11 @@ class Request:
     def is_finished(self) -> bool:
         return len(self.generated_token_ids) >= self.max_new_tokens
 
-    def append_token(self, token_id: int) -> None:
+    def append_token(self, token_id: int, logprob: float) -> None:
         if self.is_finished:
             raise RuntimeError("cannot append token to a finished request")
         self.generated_token_ids.append(token_id)
+        self.generated_logprobs.append(logprob)
         if self.is_finished:
             self.status = RequestStatus.FINISHED
 
@@ -159,7 +161,10 @@ class Sampler:
         mask.scatter_(dim=-1, index=sorted_indices, src=sorted_mask)
         return logits.masked_fill(mask, float("-inf"))
 
-    def sample(self, logits: torch.Tensor) -> list[int]:
+    def sample(
+        self,
+        logits: torch.Tensor,
+    ) -> tuple[list[int], list[float]]:
         if logits.dim() != 2:
             raise ValueError("logits must have shape [batch_size, vocab_size]")
 
@@ -169,8 +174,12 @@ class Sampler:
 
         if self.do_sample:
             probs = torch.softmax(filtered_logits, dim=-1)
-            return torch.multinomial(probs, num_samples=1).squeeze(-1).tolist()
-        return torch.argmax(filtered_logits, dim=-1).tolist()
+            token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        else:
+            token_ids = torch.argmax(filtered_logits, dim=-1)
+        logprobs = torch.log_softmax(filtered_logits, dim=-1)
+        sampled_logprobs = logprobs.gather(1, token_ids[:, None]).squeeze(1)
+        return token_ids.tolist(), sampled_logprobs.tolist()
 
 
 @dataclass(frozen=True)
@@ -206,7 +215,7 @@ class NanoEngine:
             num_layers=model_runner.num_layers,
             num_heads=model_runner.num_heads,
             head_dim=model_runner.head_dim,
-            device=model_runner.device,
+            device=model_runner.embedding.weight.device,
         )
         self._next_request_id = 0
 
@@ -236,15 +245,20 @@ class NanoEngine:
                         logits.append(self.model_runner.decode(request, self.kv_cache))
             with record_function("Stack_and_Sample"):
                 logits = torch.stack(logits, dim=0)
-                token_ids = self.sampler.sample(logits)
+                token_ids, logprobs = self.sampler.sample(logits)
             with record_function("Update_Request_State"):
-                for request, token_id in zip(batch, token_ids, strict=True):
+                for request, token_id, logprob in zip(
+                    batch,
+                    token_ids,
+                    logprobs,
+                    strict=True,
+                ):
                     try:
                         request.block_table.ensure_block_capacity(request.num_tokens + 1, self.allocator)
                     except BlockAllocationError:
                         self.scheduler.preempt_request(request)
                         continue
-                    request.append_token(token_id)
+                    request.append_token(token_id, logprob)
                     generated[request.request_id] = token_id
                     if request.is_finished:
                         self.scheduler.finish_request(request)
@@ -256,3 +270,8 @@ class NanoEngine:
             free_blocks=self.allocator.num_free_blocks,
             generated=generated,
         )
+
+    def release_kv_cache(self) -> int:
+        released_bytes = self.kv_cache.cache.numel() * self.kv_cache.cache.element_size()
+        self.kv_cache.release()
+        return released_bytes

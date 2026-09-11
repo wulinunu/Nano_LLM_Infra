@@ -7,18 +7,17 @@ import torch
 import torch.distributed as dist
 from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 
-from nano_llm_infra.inference.TinyTransformerModel import TinyMLP
-from nano_llm_infra.training import (
-    GradientReducer,
-    AmpEngine,
+from nano_llm_infra.models.tiny_transformer import TinyMLP, TinyTransformerModel
+from nano_llm_infra.training.amp import AmpEngine
+from nano_llm_infra.training.distributed.data_parallel import (
     DataParallelRuntime,
-    TinyTrainingTransformer,
-    ZeroRuntime,
+    GradientReducer,
 )
 from nano_llm_infra.training.distributed.pipeline_parallel import (
     PipelineRuntime,
     build_pipeline_stage_model,
 )
+from nano_llm_infra.training.distributed.zero import ZeroRuntime
 from nano_llm_infra.training.distributed.tensor_parallel import (
     TPMLP,
     check_tp_mlp,
@@ -108,7 +107,7 @@ def run_dp(args: argparse.Namespace, device: torch.device, rank: int, world_size
     initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     num_heads = 4 if args.hidden_size % 4 == 0 else 2
     torch.manual_seed(0)
-    model = TinyTrainingTransformer(
+    model = TinyTransformerModel(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
@@ -201,7 +200,7 @@ def run_pp(args: argparse.Namespace, device: torch.device, rank: int, world_size
         raise ValueError("--batch-size must be divisible by --num-microbatches")
 
     torch.manual_seed(0)
-    full_model = TinyTrainingTransformer(
+    full_model = TinyTransformerModel(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
@@ -252,7 +251,7 @@ def run_pp(args: argparse.Namespace, device: torch.device, rank: int, world_size
 def run_zero(args: argparse.Namespace, device: torch.device, rank: int, world_size: int) -> None:
     initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     torch.manual_seed(0)
-    model = TinyTrainingTransformer(
+    model = TinyTransformerModel(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,

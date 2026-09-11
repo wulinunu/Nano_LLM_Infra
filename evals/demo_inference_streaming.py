@@ -8,7 +8,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from nano_llm_infra.inference.block_manager import BlockAllocator
 from nano_llm_infra.inference.engine import IterationLevelScheduler, NanoEngine, Sampler
-from nano_llm_infra.inference.TinyTransformerModel import TinyTransformerModel
+from nano_llm_infra.models.tiny_transformer import TinyTransformerModel
 
 
 def main() -> None:

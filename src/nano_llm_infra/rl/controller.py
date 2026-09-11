@@ -83,6 +83,7 @@ class WorkerGroup:
     def __init__(self, pool: ResourcePool) -> None:
         self.pool = pool
         self.workers = pool.workers
+        self.last_rollout_metrics: dict[str, float] = {}
 
     def _invoke(self, method: str, arguments: list[tuple]) -> list:
         import ray
@@ -102,7 +103,13 @@ class WorkerGroup:
     def rollout(self, prompts: list[Prompt]) -> list[Experience]:
         chunks = self._split(prompts)
         results = self._invoke("rollout", [(chunk,) for chunk in chunks])
-        return [item for result in results for item in result]
+        self.last_rollout_metrics = {
+            "kv_pool_mb": sum(result[1]["kv_pool_mb"] for result in results),
+            "kv_blocks_peak": max(result[1]["kv_blocks_peak"] for result in results),
+            "rollout_memory_mb": max(result[1]["rollout_memory_mb"] for result in results),
+            "released_memory_mb": max(result[1]["released_memory_mb"] for result in results),
+        }
+        return [item for result in results for item in result[0]]
 
     def train(self, experiences: list[Experience]) -> dict[str, float]:
         groups: dict[int, list[Experience]] = {}
@@ -122,6 +129,10 @@ class WorkerGroup:
             key: sum(result[key] * result["samples"] for result in results)
             / total_samples
             for key in ("loss", "kl", "reward", "grad_norm")
+        } | {
+            "zero_backward_memory_mb": max(
+                result["zero_backward_memory_mb"] for result in results
+            )
         }
 
     def sync_weights(self, mode: str = "gpu") -> dict[str, float]:
@@ -192,6 +203,17 @@ class RLController:
             kl=train_metrics["kl"],
             grad_norm=train_metrics["grad_norm"],
             gpu_memory_mb=self.worker_group.memory_mb(),
+            kv_pool_mb=self.worker_group.last_rollout_metrics["kv_pool_mb"],
+            kv_blocks_peak=int(
+                self.worker_group.last_rollout_metrics["kv_blocks_peak"]
+            ),
+            rollout_memory_mb=self.worker_group.last_rollout_metrics[
+                "rollout_memory_mb"
+            ],
+            released_memory_mb=self.worker_group.last_rollout_metrics[
+                "released_memory_mb"
+            ],
+            zero_backward_memory_mb=train_metrics["zero_backward_memory_mb"],
         )
         self.step += 1
         return metrics

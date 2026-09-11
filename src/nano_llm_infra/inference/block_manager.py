@@ -147,3 +147,6 @@ class KVCachePool:
             raise ValueError(f"value shape {tuple(value.shape)} does not match {expected_shape}")
         block_key[:, token_offset, :].copy_(key)
         block_value[:, token_offset, :].copy_(value)
+
+    def release(self) -> None:
+        self.cache = torch.empty(0)

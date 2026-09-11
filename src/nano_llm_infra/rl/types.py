@@ -17,13 +17,19 @@ class Phase(str, Enum):
 class RLConfig:
     vocab_size: int = 64
     hidden_size: int = 64
-    max_seq_len: int = 64
+    num_layers: int = 2
+    num_heads: int = 4
     group_size: int = 4
     response_length: int = 12
     temperature: float = 1.0
     learning_rate: float = 3e-3
     kl_beta: float = 0.04
     reward_workers: int = 4
+    kv_block_size: int = 4
+    kv_num_blocks: int = 256
+    rollout_batch_size: int = 16
+    zero_stage: int = 2
+    zero_bucket_size_mb: float = 0.05
 
 
 @dataclass
@@ -74,3 +80,8 @@ class StepMetrics:
     kl: float
     grad_norm: float
     gpu_memory_mb: float
+    kv_pool_mb: float
+    kv_blocks_peak: int
+    rollout_memory_mb: float
+    released_memory_mb: float
+    zero_backward_memory_mb: float
