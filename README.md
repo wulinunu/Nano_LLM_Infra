@@ -146,7 +146,103 @@
 
 ---
 
-## 🧠 模块四：Mini AI Compiler（计算图编译核心）
+
+
+## 🔄 模块四：Mini HybridFlow（Colocated GRPO）
+**目标**：不复刻完整 veRL，而是用一个可运行的小模型手写它最关键的执行原理。
+
+```text
+RLController -> WorkerGroup -> ColocatedWorker
+                               ├── training_policy
+                               ├── rollout_policy
+                               └── reference_policy（冻结）
+
+Rollout -> Reward -> GRPO Train -> Weight Sync -> Next Rollout
+```
+
+### 1. Single Controller 与 WorkerGroup
+* `RLController` 只定义 `ROLLOUT -> REWARD -> TRAIN -> SYNC` 控制流。
+* `WorkerGroup` 位于 Controller 和 GPU Worker 之间，负责数据切分、Ray 远程调用、等待与结果合并。
+* `ResourcePool` 使用 Ray Placement Group 创建每张 GPU 一个 Worker，并初始化 NCCL Process Group。
+* **核心文件**：`rl/controller.py`。
+
+这体现了 HybridFlow 的基本边界：RL 算法控制流不需要知道模型计算发生在哪张卡，也不直接调用 `ray.get()`。
+
+### 2. Colocation 与 Temporal Multiplexing
+每个 `ColocatedWorker` 在同一设备上持有 Training、Rollout 和冻结的 Reference Policy。
+
+* Rollout Policy 自回归采样 Response。
+* Training Policy 计算 GRPO 梯度，通过 NCCL AllReduce 得到多卡平均梯度后更新参数。
+* Reference Policy 保持初始权重，只计算 KL 约束。
+* Rollout 结束后释放临时 Tensor，再进入 Training。
+* **核心文件**：`rl/worker.py`。
+
+### 3. 手写 Weight Sync
+训练模型更新后，Worker 显式完成：
+
+```text
+检查参数名称
+    -> Flatten 到连续设备 Buffer
+    -> 设备内 Tensor Copy
+    -> Unflatten 覆盖 rollout_policy
+    -> policy_version + 1
+```
+
+同时保留 CPU `state_dict` 中转作为 Baseline，比较同步延迟和 CPU Copy Bytes。这里没有调用 vLLM Weight Transfer，因此同步过程可以直接从代码中读出来。
+
+### 4. Group-Aware Sequence Packing
+`packing.py` 手写：
+
+* 多条 Experience 拼成连续 `packed_tokens`。
+* 使用 `cu_seqlens` 保存每条序列边界。
+* 每条序列的 `position_ids` 从 0 重新开始。
+* 构造分段 Causal Mask，禁止不同序列互相 Attention。
+* 保留 `group_id`，确保 GRPO 组内 Advantage 不被打乱。
+
+当前 Tiny Attention 用 PyTorch 显式实现语义；真正的 FlashAttention Varlen Kernel 属于后续性能 Backend。
+
+### 5. 最小 GRPO 与 Async Reward
+`policy.py` 实现 Tiny Causal Policy、自回归采样、Old Logprob、组内 Reward 标准化、clipped policy loss 和 Reference KL。
+
+`old_policy` 是当前 Batch 的采样快照，用于计算 PPO Ratio；`reference_policy` 是训练开始时冻结的初始模型，用于限制 Training Policy 偏移。
+
+规则 Reward 通过 `asyncio + ProcessPoolExecutor` 并发执行。当前 Batch 在训练前仍等待 Reward 完成，因此它是并发 Reward，不是异步 RL。
+
+### 6. 运行与阅读顺序
+
+```bash
+# 单 GPU
+PYTHONPATH=src python evals/rl_demo.py
+
+# 四 GPU + Ray WorkerGroup
+PYTHONPATH=src python evals/rl_demo.py --num-workers 4
+
+# 四组实验
+PYTHONPATH=src python evals/rl_demo.py --benchmark
+
+# 四卡实验
+PYTHONPATH=src python evals/rl_demo.py --benchmark --num-workers 4
+```
+
+建议按 `types.py -> packing.py -> policy.py -> worker.py -> controller.py -> demo` 阅读。
+
+### 7. Benchmark
+`rl_demo.py --benchmark` 输出：
+
+1. Colocation 实测 Step Time，以及 Static Split 的资源空闲估算。
+2. CPU Weight Sync 与设备内直接同步的延迟和 CPU Copy Bytes。
+3. Padding Tokens、Packed Tokens、Padding Ratio 和跨序列隔离检查。
+4. 串行与进程池 Reward 的耗时。
+
+小模型 Benchmark 用于证明机制和趋势，不宣称等价于 veRL 在大模型集群上的工业性能。
+
+### 8. 实现边界
+我们手写 Controller、WorkerGroup、阶段切换、Packing、GRPO 数据流和权重同步。Ray 负责进程/GPU 调度，PyTorch 提供 Tensor、Autograd 与 NCCL Collective。
+
+当前不包含 vLLM、FSDP、跨节点容错和模型特定权重映射；它们可以作为后续真实 Backend 接入，而不改变外层 Controller。
+---
+
+## 🧠 模块五：Mini AI Compiler（计算图编译核心）
 > 构建一个最小但完整的端到端编译链路
 > `Graph -> IR -> Pass (Fusion & Memory) -> Lowering -> Codegen (Triton) -> Run`
 
@@ -200,16 +296,16 @@
     * Codegen 与 Dispatch 的区别是什么？
     * 为什么现代 AI 编译器（如 TorchInductor）倾向于生成 Triton / C++ 代码，而不是直接生成机器码？
     * AI 编译器（Compile-time）与运行时（Runtime）的边界在哪里？如何处理 Dynamic Shape？
-
+* **验收**：
+    - **编译链路可解释**：能清晰展示一个简单模型从 `torch.fx Graph` 到 `Fusion Pass`、再到 `Lowering / Dispatch` 的全过程。
+    - **技术博客 / 白板**：能清晰画出：
+        * PagedAttention 的逻辑映射图
+        * RMSNorm 的归约逻辑
+        * 同步 GRPO 的阶段切换与权重同步路径
+        * 一个简单计算图的融合与 lowering 过程
 ---
 
 ## 📊 总验收指标（DoD）
 1. **一键运行**：所有模块支持 `uv run` 或 `python setup.py` 自动化部署与测试。
 2. **量化报告**：`reports/` 目录下拥有完整的性能对比图表（Speedup、Memory Saving、Latency Breakdown）。
-3. **编译链路可解释**：能清晰展示一个简单模型从 `torch.fx Graph` 到 `Fusion Pass`、再到 `Lowering / Dispatch` 的全过程。
-4. **技术博客 / 白板**：能清晰画出：
-   * PagedAttention 的逻辑映射图
-   * RMSNorm 的归约逻辑
-   * 一个简单计算图的融合与 lowering 过程
-
 ---

@@ -11,6 +11,11 @@ dependencies = [
     "triton==3.6.0"
 ]
 
+[project.optional-dependencies]
+rl = [
+    "ray>=2.40",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu129" }
 torchvision = { index = "pytorch-cu129" }
