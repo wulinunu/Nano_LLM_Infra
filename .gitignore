@@ -3,7 +3,3 @@ __pycache__/
 *.o
 *.pyc
 build/
-reports/traces
-*.ncu-rep
-*.nsys-rep
-*.qdrep
