@@ -42,7 +42,14 @@ async def run_benchmarks(
     controller: RLController,
     prompts: list[Prompt],
 ) -> None:
-    metrics = await controller.run_step(prompts)
+    for _ in range(3):
+        await controller.run_step(prompts)
+
+    results = []
+    for _ in range(10):
+        results.append(await controller.run_step(prompts))
+
+    metrics = results[-1]
     print(
         f"[flow] kv_pool={metrics.kv_pool_mb:.2f}MB "
         f"peak_blocks={metrics.kv_blocks_peak} "
@@ -50,18 +57,20 @@ async def run_benchmarks(
         f"zero2_memory={metrics.zero_backward_memory_mb:.1f}MB "
         f"version={metrics.policy_version}"
     )
-    colocated_ms = (
-        metrics.rollout_ms + metrics.reward_ms + metrics.train_ms + metrics.sync_ms
-    )
-    static_ms = (
-        metrics.rollout_ms * 2
-        + metrics.reward_ms
-        + metrics.train_ms * 2
-        + metrics.sync_ms
-    )
+    colocated_ms = sum(
+        item.rollout_ms + item.reward_ms + item.train_ms + item.sync_ms
+        for item in results
+    ) / len(results)
+    static_ms = sum(
+        item.rollout_ms * 2
+        + item.reward_ms
+        + item.train_ms * 2
+        + item.sync_ms
+        for item in results
+    ) / len(results)
     samples = len(prompts) * controller.config.group_size
     print(
-        f"[colocation] step={colocated_ms:.1f}ms "
+        f"[colocation] avg_step={colocated_ms:.1f}ms "
         f"samples/s={samples / colocated_ms * 1000:.2f} "
         f"static_split_estimate={static_ms:.1f}ms"
     )

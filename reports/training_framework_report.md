@@ -72,7 +72,25 @@ ZeRO-3 进一步切分参数，反向结束显存从 4632.7 MB 降到 3094.5 MB�
 
 ![ZeRO-3 显存时间曲线](./zero3.jpg)
 
-## 6. 总结
+## 6. Expert Parallelism
+
+双卡 EP 在 4 个 Expert、1024 个 Token 的配置下，两次测试的单步耗时分别为 11.172 ms 和 12.160 ms，平均约 11.666 ms，峰值显存均为 87.3 MB。
+
+输出最大误差为 `8.94e-8`，输入梯度最大误差为 `2.24e-7`，Expert 梯度最大误差为 `3.81e-6`。Router 梯度最大误差为 `1.91e-5`，来自不同通信与累加顺序下的浮点误差。结果说明 Token Dispatch、Expert Compute、Combine 及其反向传播与 Dense MoE 参考实现基本一致。
+
+Expert 负载为 `[280, 260, 219, 265]`，最大负载约为最小负载的 1.28 倍。在 `capacity_factor=1.0` 时，每个 Expert 容量为 256，因此共丢弃 37 个 Token，占总 Token 的约 3.6%。这个结果直接体现了 Router 负载不均和固定 Capacity 带来的 Token Drop，也说明负载最重的 Expert 会成为 EP 的潜在 Straggler。
+
+## 7. Context Parallelism
+
+双卡 CP 将长度为 1024 的完整序列切成每卡 512 Token，通过 Ring P2P 轮转 K/V，使每张卡保留本地 Query，同时完成对完整上下文的 Causal Attention。
+
+前向输出最大误差为 `3.58e-7`，输入梯度最大误差为 `1.10e-5`，QKV 梯度最大误差为 `6.41e-4`，输出投影梯度最大误差为 `9.16e-5`。前向结果与 Dense Attention 高度一致；梯度误差稍大，主要来自长序列分块计算、Online Softmax 和跨 Rank 梯度累加顺序不同，当前数量级可以接受。
+
+修复 P2P 收发 Tensor 的连续内存布局后，非连续 Tensor Warning 消失，QKV 梯度误差从 `6.25` 降至 `6.41e-4`，说明 Ring Exchange 的前向与反向通信路径已经正确工作。
+
+20 次正式迭代的平均单步耗时为 `11.092 ms`，峰值显存为 `145.4 MB`。这组数据证明双卡 Ring Attention 能够正确切分序列并完成前向和反向，但当前只测试了长度 1024，尚不能证明已经突破单卡长序列 OOM 上限。
+
+## 8. 总结
 
 测试结果验证了各模块的核心设计：
 
@@ -80,12 +98,14 @@ ZeRO-3 进一步切分参数，反向结束显存从 4632.7 MB 降到 3094.5 MB�
 2. TP 在大矩阵计算中能够有效分摊计算和参数存储，同时保持数值正确性。
 3. GPipe 更快但保存更多激活；1F1B 显存更低，但小模型下调度开销明显。
 4. ZeRO 各阶段确实依次消除了优化器状态、梯度和参数冗余；当前 Demo 的主要限制是 ZeRO-3 尚未实现逐层参数拉取。
+5. EP 的输出和梯度与 Dense MoE 基本对齐；实测负载分布和 Token Drop 验证了 Capacity 与 Router 不均衡机制。
+6. CP 的前向和梯度与 Dense Attention 基本对齐，验证了序列切分、Ring P2P 和 Online Softmax 的正确性。
 
-本次结果来自单次双卡测试，主要用于验证实现逻辑。若要做严格性能结论，还需要固定 GPU 型号与软件环境，进行多次重复测试并统计均值和波动范围。
+本次结果主要用于验证实现逻辑。若要做严格性能结论，还需要固定 GPU 型号与软件环境，进行更多重复测试并统计均值和波动范围。
 
-## 7. 原始测试命令与输出
+## 9. 原始测试命令与输出
 
-### 7.1 DP 基线（FP32）
+### 9.1 DP 基线（FP32）
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode dp \
@@ -98,7 +118,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode dp \
 [dp] loss=4.8780 avg_step=29.113 ms throughput=140691.7 tok/s peak_mem=1422.1 MB
 ```
 
-### 7.2 DP + AMP
+### 9.2 DP + AMP
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode dp \
@@ -111,7 +131,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode dp \
 [dp] loss=4.8780 avg_step=23.901 ms throughput=171371.5 tok/s peak_mem=1293.6 MB
 ```
 
-### 7.3 DP + 激活检查点
+### 9.3 DP + 激活检查点
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode dp \
@@ -124,7 +144,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode dp \
 [dp] loss=4.8780 avg_step=32.867 ms throughput=124621.8 tok/s peak_mem=1175.5 MB
 ```
 
-### 7.4 DP 通信与计算重叠
+### 9.4 DP 通信与计算重叠
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode dp \
@@ -137,7 +157,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode dp \
 [dp] loss=4.8780 avg_step=29.468 ms throughput=138999.4 tok/s peak_mem=1422.1 MB
 ```
 
-### 7.5 张量并行
+### 9.5 张量并行
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode tp \
@@ -153,7 +173,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode tp \
 [tp] TP MLP fwd+bwd:    32.088 ms, peak_mem=1936.3 MB
 ```
 
-### 7.6 PP Naive
+### 9.6 PP Naive
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode pp \
@@ -168,7 +188,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode pp \
 [pp] naive: F0 B0 F1 B1 F2 B2 F3 B3
 ```
 
-### 7.7 PP GPipe
+### 9.7 PP GPipe
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode pp \
@@ -183,7 +203,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode pp \
 [pp][rank 1] last microbatch loss=1.1789
 ```
 
-### 7.8 PP 1F1B
+### 9.8 PP 1F1B
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode pp \
@@ -198,7 +218,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode pp \
 [pp][rank 1] last microbatch loss=1.1750
 ```
 
-### 7.9 ZeRO-0
+### 9.9 ZeRO-0
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode zero \
@@ -214,7 +234,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode zero \
 [zero0] avg_step=517.347 ms, peak_mem=12542.5 MB, bw_end_mem=9247.1 MB
 ```
 
-### 7.10 ZeRO-1
+### 9.10 ZeRO-1
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode zero \
@@ -230,7 +250,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode zero \
 [zero1] avg_step=532.059 ms, peak_mem=9466.2 MB, bw_end_mem=6170.8 MB
 ```
 
-### 7.11 ZeRO-2
+### 9.11 ZeRO-2
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode zero \
@@ -246,7 +266,7 @@ torchrun --nproc_per_node=2 evals/train.py --mode zero \
 [zero2] avg_step=531.973 ms, peak_mem=9465.2 MB, bw_end_mem=4632.7 MB
 ```
 
-### 7.12 ZeRO-3
+### 9.12 ZeRO-3
 
 ```bash
 torchrun --nproc_per_node=2 evals/train.py --mode zero \
@@ -259,4 +279,51 @@ torchrun --nproc_per_node=2 evals/train.py --mode zero \
 [zero3] after rank1=[]
 [zero3] world=2 hidden=2048 batch=4 seq=1024
 [zero3] avg_step=529.135 ms, peak_mem=9464.2 MB, bw_end_mem=3094.5 MB
+```
+
+### 9.13 Expert Parallelism
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=src torchrun --standalone \
+  --nproc_per_node=2 evals/train.py \
+  --mode ep \
+  --hidden-size 512 \
+  --batch-size 8 \
+  --seq-len 128 \
+  --num-experts 4 \
+  --capacity-factor 1.0 \
+  --warmup 5 \
+  --steps 20
+```
+
+```text
+[ep] world=2 experts=4 capacity_factor=1.0
+[ep] output diff=8.940697e-08, input.grad diff=2.235174e-07, router grad diff=1.907349e-05, expert grad diff=3.814697e-06
+[ep] expert_load=[280, 260, 219, 265] dropped_tokens=37
+[ep] avg_step=11.172 ms, peak_mem=87.3 MB
+```
+
+重复测试：
+
+```text
+[ep] avg_step=12.160 ms, peak_mem=87.3 MB
+```
+
+### 9.14 Context Parallelism
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=src torchrun --standalone \
+  --nproc_per_node=2 evals/train.py \
+  --mode cp \
+  --hidden-size 512 \
+  --batch-size 4 \
+  --seq-len 1024 \
+  --warmup 5 \
+  --steps 20
+```
+
+```text
+[cp] world=2 global_seq=1024 local_seq=512
+[cp] output diff=3.576279e-07, input.grad diff=1.096725e-05, qkv grad diff=6.408691e-04, out_proj grad diff=9.155273e-05
+[cp] avg_step=11.092 ms, peak_mem=145.4 MB
 ```

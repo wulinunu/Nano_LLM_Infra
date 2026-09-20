@@ -148,7 +148,7 @@
 
 
 
-## 🔄 模块四：Mini HybridFlow（Colocated GRPO）
+## 🔄 模块四：Mini RL infra（Colocated GRPO）
 **目标**：不复刻完整 veRL，而是用一个可运行的小模型手写它最关键的执行原理。
 
 ```text

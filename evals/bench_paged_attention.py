@@ -5,8 +5,10 @@ from collections.abc import Callable
 
 import torch
 
+from nano_llm_infra import _paged_attention
 from nano_llm_infra.inference.block_manager import BlockTable, KVCachePool
-from nano_llm_infra.ops.paged_attention import paged_attention
+from nano_llm_infra.ops.pytorch_ref.paged_attention_ref import paged_attention_ref
+from nano_llm_infra.ops.triton.paged_attention import paged_attention_triton
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,27 +123,32 @@ def compare_case(
         f"num_heads={num_heads} head_dim={head_dim} dtype={dtype} ==="
     )
 
-    backends = ("ref", "triton", "cuda")
-    ref_out = paged_attention(
-        query=query,
-        kv_cache=kv_cache,
-        block_table=block_table,
-        layer_idx=0,
-        num_tokens=num_tokens,
-        impl="ref",
+    q = query.unsqueeze(0).contiguous()
+    k_cache = kv_cache.keys[:, 0].contiguous()
+    v_cache = kv_cache.values[:, 0].contiguous()
+    block_tables = torch.tensor(
+        [block_table.block_ids],
+        device=device,
+        dtype=torch.int32,
     )
+    context_lens = torch.tensor([num_tokens], device=device, dtype=torch.int32)
+
+    backend_fns = {
+        "ref": lambda: paged_attention_ref(
+            q, k_cache, v_cache, block_tables, context_lens, block_size
+        ),
+        "triton": lambda: paged_attention_triton(
+            q, k_cache, v_cache, block_tables, context_lens, block_size
+        ),
+        "cuda": lambda: _paged_attention.paged_attention_cuda(
+            q, k_cache, v_cache, block_tables, context_lens, block_size
+        ),
+    }
+    ref_out = backend_fns["ref"]()
     results: list[tuple[str, float]] = []
 
-    for impl in backends:
+    for impl, fn in backend_fns.items():
         try:
-            fn = lambda current_impl=impl: paged_attention(
-                query=query,
-                kv_cache=kv_cache,
-                block_table=block_table,
-                layer_idx=0,
-                num_tokens=num_tokens,
-                impl=current_impl,
-            )
             out = fn()
             check_close(impl, out, ref_out, rtol=rtol, atol=atol)
             latency_ms = time_cuda(fn, warmup=warmup, iters=iters)

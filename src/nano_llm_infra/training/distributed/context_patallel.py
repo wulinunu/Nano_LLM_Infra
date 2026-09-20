@@ -22,10 +22,11 @@ class _RingExchange(torch.autograd.Function):
         rank_index = global_ranks.index(dist.get_rank())
         next_rank = global_ranks[(rank_index + 1) % len(global_ranks)]
         previous_rank = global_ranks[(rank_index - 1) % len(global_ranks)]
-        output = torch.empty_like(input_)
+        contiguous_input = input_.contiguous()
+        output = torch.empty_like(contiguous_input)
         requests = dist.batch_isend_irecv( #非阻塞操作
             [
-                dist.P2POp(dist.isend, input_.contiguous(), next_rank, group),
+                dist.P2POp(dist.isend, contiguous_input, next_rank, group),
                 dist.P2POp(dist.irecv, output, previous_rank, group),
             ]
         )
@@ -41,11 +42,12 @@ class _RingExchange(torch.autograd.Function):
         rank_index = ctx.global_ranks.index(dist.get_rank())
         next_rank = ctx.global_ranks[(rank_index + 1) % len(ctx.global_ranks)]
         previous_rank = ctx.global_ranks[(rank_index - 1) % len(ctx.global_ranks)]
-        grad_input = torch.empty_like(grad_output)
+        contiguous_grad = grad_output.contiguous()
+        grad_input = torch.empty_like(contiguous_grad)
         requests = dist.batch_isend_irecv(
             [
                 dist.P2POp(
-                    dist.isend, grad_output.contiguous(), previous_rank, ctx.group
+                    dist.isend, contiguous_grad, previous_rank, ctx.group
                 ),
                 dist.P2POp(dist.irecv, grad_input, next_rank, ctx.group),
             ]

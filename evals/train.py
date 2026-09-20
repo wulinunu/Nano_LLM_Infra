@@ -349,7 +349,7 @@ def run_ep(args: argparse.Namespace, device: torch.device, rank: int, world_size
             f"router grad diff={router_grad_diff:.6e}, expert grad diff={expert_grad_diff:.6e}"
         )
         print(
-            f"[ep] expert_load={ep_moe.last_expert_load.tolist()} "
+            f"[ep] expert_load={ep_moe.last_routed_expert_load.tolist()} "
             f"dropped_tokens={ep_moe.last_dropped_tokens}"
         )
         print(
