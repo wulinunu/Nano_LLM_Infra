@@ -1,9 +1,5 @@
-import argparse
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-from torch.profiler import ProfilerActivity, profile, record_function
 
 from src.nano_llm_infra.compiler.ir import GraphCapturer
 from src.nano_llm_infra.compiler.passes import PassManager, FusionPass, MemoryPlanningPass
@@ -33,7 +29,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-def run_compiler_pipeline(profile_execution: bool = False, profile_iters: int = 10):
+def run_compiler_pipeline():
     dim = 128
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = TransformerBlock(dim).to(device)
@@ -117,28 +113,6 @@ def run_compiler_pipeline(profile_execution: bool = False, profile_iters: int = 
         print("原生 PyTorch 输出:\n", expected_out[:3, :3])
         print("编译器生成的输出:\n", compiled_out[:3, :3])
 
-        if profile_execution:
-            activities = [ProfilerActivity.CPU]
-            if device == "cuda":
-                activities.append(ProfilerActivity.CUDA)
-
-            with profile(activities=activities) as prof:
-                for _ in range(profile_iters):
-                    with record_function("Eager"):
-                        model(x.clone(), res.clone())
-                    with record_function("Compiled"):
-                        dispatch_fn(
-                            x.clone(),
-                            res.clone(),
-                            model.weight,
-                            model.linear.weight,
-                            model.linear.bias,
-                        )
-
-            Path("reports/traces").mkdir(parents=True, exist_ok=True)
-            prof.export_chrome_trace("reports/traces/compiler_eager_vs_compiled.json")
-            print("\nTrace: reports/traces/compiler_eager_vs_compiled.json")
-        
     except Exception as e:
         print(f"⚠️ 执行时遇到错误: {e}")
         print("✅ 逻辑编译流程验证成功，Pipeline 结构畅通。")
@@ -148,8 +122,4 @@ def run_compiler_pipeline(profile_execution: bool = False, profile_iters: int = 
             os.remove(tmp_file)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--profile-iters", type=int, default=10)
-    args = parser.parse_args()
-    run_compiler_pipeline(args.profile, args.profile_iters)
+    run_compiler_pipeline()

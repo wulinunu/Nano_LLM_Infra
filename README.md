@@ -8,6 +8,14 @@
 * **最小闭环优先 (MVP)**：拒绝过度工程，先跑通主逻辑，再逐步增强性能与抽象层次。
 * **benchmark验证**：所有优化都必须有 Benchmark 数据支持，不仅要快，还要说清为什么快。
 
+Profiling 采用“一种工具解决一类问题”的方式，避免每个模块重复铺设：
+
+- `ncu`：RMSNorm Kernel 的 Shared Memory、Wavefront 和 Bank Conflict。
+- `torch.profiler`：Inference Engine 的 Scheduler / Prefill / Decode Timeline。
+- `nsys`：DP Backward Compute 与 NCCL AllReduce 的重叠。
+
+统一命令和判读方法见 `reports/profiling_report.md`。
+
 ---
 
 ## 🛠️ 模块一：算子性能工程
@@ -19,14 +27,13 @@
 * **DoD**：
     * **正确性**：`torch.allclose` 对比原版，FP16 误差可解释。
     * **性能**：提供 `benchmark/bench_rmsnorm.py`，量化 HBM 读写次数减少带来的 Speedup。
-    * **微观分析 (Micro Profiling)**：使用 `ncu` (Nsight Compute) 证明 Warp-shuffle 版本比 Shared Memory 版本具有更高的 SM 占用率 (Occupancy) 或更低的 Bank Conflict。
+    * **微观分析 (Micro Profiling)**：使用 `ncu` 证明 Warp-shuffle 版本减少 Shared Memory 指令和 Bank Conflict。
 
 ### 2. Mini-FlashAttention（可后置）
 * **核心逻辑**：不物化 $O(T^2)$ 矩阵，实现 Tiling + Online Softmax。
 * **DoD**：
     * **正确性**：输出与 PyTorch reference 对齐。
     * **性能 & 自动调优 (Autotuning)**：引入 `@triton.autotune` 自动搜索最优 `BLOCK_M/N` 等参数。
-    * **微观分析 (Micro Profiling)**：使用 `ncu` 采集真实 Memory Throughput，证明相比 Reference 真正消除了 $O(T^2)$ 读写量。
 * **面试考点**：
     * SRAM 限制与 Tiling 逻辑推导。
     * 为什么同一个 Kernel 在不同 Shape 下最优 Grid/Block 组织方式完全不同？(Autotune 的意义)。
@@ -56,7 +63,6 @@
     * 进阶级：使用cuda代码完成PagedAttention Kernel
 * **DoD（完成标准）**：
     * 输出的 Logits 与标准连续内存 Attention 产生的结果在数值上严格对齐（精度误差 < 1e-3）。
-    * **微观分析 (Micro Profiling)**：使用 `ncu` 分析在非连续物理内存寻址时的 L1/L2 Cache Hit Rate 变化与访存带宽代价。
 * **面试考点**：
     * PagedAttention 在硬件（SM、SRAM）层面为什么能大幅提升访存带宽利用率（Memory Bandwidth Utilization）？
     * Triton/CUDA 算子开发中，如何通过 Block Table 进行非连续内存的寻址？
@@ -79,7 +85,7 @@
     * 实现 `Engine.step()`：向调度器索要当前批次（Batch） -> 向内存管理器要物理地址（Block Tables） -> 将数据送入包含 PagedAttention 的极简模型（如迷你 Llama）进行前向传播 -> 采样下一个 Token -> 将新 Token 写入 KV Pool 对应的空闲位。
 * **DoD（完成标准）**：
     * 实现一个流式终端输出：能够同时向 Engine 发送 3 个长度不一的 Prompt，并在终端看到它们不阻塞地、同时一字一字蹦出来。
-    * **宏观分析 (Macro Profiling)**：使用 `torch.profiler` + `nvtx` 对 `Engine.step()` 埋点，抓取 Timeline，能够从 Chrome Trace 图中指出 CPU Launch Overhead 以及 GPU 饿死（Starvation）的时间段。
+    * **宏观分析 (Macro Profiling)**：使用 `torch.profiler` 对 `Engine.step()` 埋点，抓取 Timeline，分析 CPU Launch Overhead 与 GPU 空闲区间。
 * **面试考点**：
     * CPU 发射延迟 (Launch Overhead) 是什么？如何隐藏它？
     * 怎样从 Trace 图中判断当前系统是 CPU-bound 还是 GPU-bound？
@@ -109,12 +115,12 @@
 
 ### 4. Pipeline Parallelism (PP)
 * **核心实现**：层间切分与流水线调度。实现 Naive、GPipe 以及工业级主流的 **1F1B (One-Forward-One-Backward)** 交错调度。
-* **DoD**：实现 Pipeline Stage 划分，通过 `nsys` Trace 可视化 Pipeline Bubble（气泡），对比 GPipe 与 1F1B 的显存占用差异。
+* **DoD**：实现 Pipeline Stage 划分，对比 GPipe 与 1F1B 的执行时间与显存占用差异。
 * **面试考点**：气泡时间占比公式是什么？1F1B 是如何降低峰值显存的（Activation 缓存数量）？
 
 ### 5. Expert Parallelism (EP / MoE)
 * **核心实现**：手写最小 MoE 层，将 Experts 分布到不同 Rank。使用 `all_to_all_single()` 完成 Token Dispatch 和 Combine。处理容量因子（Capacity Factor）。
-* **DoD**：单机 2 卡跑通 EP。打印 Expert 负载，使用 `nsys` 查看两次 All-to-All 耗时及与 Expert Compute 的执行关系。
+* **DoD**：单机 2 卡跑通 EP，验证输出与梯度，并打印 Expert 负载与 Dropped Tokens。
 * **面试考点**：EP 为什么使用 All-to-All 而不是 AllReduce？Router 负载不均为什么会造成 Straggler？
 
 ### 6. Context Parallelism (CP / 序列并行)
@@ -308,7 +314,6 @@ KV allocate -> Continuous rollout -> KV release -> ZeRO-2 train -> Weight sync
 * **DoD**：
     * 整条 Mini Compiler 链路成功跑通：输入 PyTorch 模型后，依次完成 `捕获 -> 融合/内存优化 -> Lowering -> Triton Codegen -> Dispatch 执行`。
     * 通过 `torch.testing.assert_close` 验证编译后执行结果与 PyTorch Eager 模式数值对齐。
-    * **宏观分析 (Macro Profiling)**：对比 Eager 模式与 Compiled 模式的 `nsys` / `torch.profiler` Trace，量化展示算子融合 (Fusion) 后，Kernel 发射间隙（Gap）的显著消除。
 * **面试考点**：
     * Codegen 与 Dispatch 的区别是什么？
     * 为什么现代 AI 编译器（如 TorchInductor）倾向于生成 Triton / C++ 代码，而不是直接生成机器码？

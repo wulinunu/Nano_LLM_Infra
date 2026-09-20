@@ -14,6 +14,42 @@ FP32 数据并行基线的单步耗时为 29.113 ms，吞吐量为 140691.7 tok/
 - 激活检查点将峰值显存降低到 1175.5 MB，减少约 17.3%；但单步耗时增加约 12.9%。结果符合“用额外重计算换取显存”的设计目标。
 - 将通信 bucket 设置为 0.01 MB 后，单步耗时为 29.468 ms，与基线基本一致。小 bucket 没有带来收益，说明过细的通信粒度会增加调度开销，bucket 大小需要结合模型和硬件调节。
 
+### Nsight Systems：DP 通信计算重叠
+
+DP Runtime 在 `dp_forward`、`dp_backward`、`bucket_N_allreduce`、`grad_sync_wait` 和 `optimizer_step` 上添加了 NVTX Range。Nsight Systems 只用于这一处宏观分布式 Timeline 分析：
+
+```bash
+OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=src \
+nsys profile --trace=cuda,nvtx,osrt \
+  --trace-fork-before-exec=true \
+  --sample=none --cpuctxsw=none \
+  --force-overwrite=true \
+  -o reports/nsys_dp_overlap \
+  torchrun --standalone --nproc_per_node=2 evals/train.py \
+  --mode dp --precision fp32 \
+  --bucket-size-mb 0.05 --warmup 5 --steps 20 \
+  --hidden-size 1024 --num-layers 4 --batch-size 8 --seq-len 256
+```
+
+导出摘要：
+
+```bash
+nsys stats --report cuda_gpu_kern_sum,nvtx_sum \
+  reports/nsys_dp_overlap.nsys-rep
+```
+
+本次采集得到：
+
+- 每卡每步形成 27 个 Gradient Bucket；两个 Rank、25 次迭代（含 5 次 warmup）共采集 1350 个 NCCL AllReduce Kernel。
+- 其中 862 个 NCCL Kernel 与同卡计算 Kernel 存在时间交集，占 `63.9%`。
+- NCCL Kernel 总时长为 `1102.397 ms`，与计算重叠的区间为 `541.007 ms`，按通信时长计算重叠率为 `49.1%`。
+- `dp_backward` CPU Range 平均为 `28.458 ms`，`grad_sync_wait` 平均为 `5.975 ms`。说明 Bucket Hook 已隐藏部分通信，但仍有明显尾部通信等待。
+- NCCL AllReduce 占 GPU Kernel 总时长的 `46.8%`。当前 `0.05 MB` Bucket 产生 27 次 AllReduce，通信粒度偏细，后续可继续合并 Bucket，权衡重叠机会与启动开销。
+
+Timeline 中可以看到 NCCL 位于独立通信 Stream，并与默认计算 Stream 上的 Backward Kernel 横向重叠，因此通信计算重叠已经真实发生，而不是只根据代码结构推断。
+
+本次 nsys 下平均单步为 `43.490 ms`、吞吐为 `94181.5 tok/s`。该数据包含 profiler 采集开销，只用于 Timeline 分析，不与无 profiler 的 `29.113 ms` 基线直接比较。
+
 ## 3. 张量并行
 
 在相同 MLP 计算任务下：

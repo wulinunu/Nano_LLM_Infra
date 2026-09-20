@@ -162,6 +162,40 @@ CUDA 在 128 Token 时最快，但从 512 Token 开始慢于 Reference。当前 
 
 因此，PagedAttention、Continuous Batching、KV Block Pool 和 Engine Step 已经组成可运行的最小推理引擎闭环。
 
+### 7.1 torch.profiler Timeline
+
+推理引擎统一使用 torch.profiler 做宏观 Timeline 分析。代码将每个 `Engine.step_N` 拆成以下范围：
+
+```text
+Scheduler
+Prefill / Decode
+Stack_and_Sample
+Update_Request_State
+```
+
+运行命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src \
+  python evals/demo_inference_streaming.py --profile
+```
+
+脚本会打印按 `self_cpu_time_total` 排序的算子摘要，并导出：
+
+```text
+reports/traces/inference_engine.json
+```
+
+本次 RTX 4090 Trace 的关键结果：
+
+- `Engine.step_0` 为 `228.8 ms`，其中首个 Prefill 为 `197.4 ms`；`Runtime Triggered Module Loading` 自耗时为 `159.7 ms`，说明首步主要是冷启动。
+- `Engine.step_1` 仍受 Lazy Loading 影响，为 `11.5 ms`。
+- `Engine.step_2~5` 稳定在 `1.82~1.95 ms`。
+- 稳定阶段 Scheduler 只有 `12~29 us`，调度状态机本身不是主要瓶颈。
+- 6 个 Step 的 CUDA Kernel Self Time 合计约 `0.49 ms`，明显小于 `247.9 ms` CPU Self Time。当前模型很小，端到端时间主要受模块加载、Python 循环和 Kernel Launch 开销影响，GPU 计算没有被充分喂满。
+
+Trace 原文件体积较大且与 GPU/软件环境强相关，因此不提交仓库；报告保留埋点语义、复现命令和判读方法。
+
 ## 8. 实现边界
 
 当前结果不能证明以下内容：
@@ -170,7 +204,7 @@ CUDA 在 128 Token 时最快，但从 512 Token 开始慢于 Reference。当前 
 - Prefill 和 Decode 仍按 Request 循环，不是生产级融合 Batch Kernel。
 - PagedAttention Benchmark 只覆盖 Batch Size 1 和 FP32。
 - 尚未提供 NCU 的 L1/L2 Cache、Memory Throughput 和 SM 利用率数据。
-- 尚未分析 `torch.profiler` Trace 中的 CPU Launch Overhead 和 GPU 空闲区间。
+- torch.profiler 的绝对时间依赖目标 GPU，跨机器比较时应重新采集 Trace。
 
 ## 9. 原始测试命令与输出
 

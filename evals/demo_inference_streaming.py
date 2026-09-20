@@ -45,7 +45,8 @@ def main() -> None:
 
     step = 0
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-    with profile(activities=activities) if args.profile else torch.no_grad() as prof:
+    profiler = profile(activities=activities, record_shapes=True) if args.profile else torch.no_grad()
+    with profiler as prof:
         while engine.scheduler.waiting or engine.scheduler.running or engine.scheduler.preempted:
             with record_function(f"Engine.step_{step}"):
                 stats = engine.step()
@@ -69,6 +70,8 @@ def main() -> None:
     if args.profile:
         Path("reports/traces").mkdir(parents=True, exist_ok=True)
         prof.export_chrome_trace("reports/traces/inference_engine.json")
+        print("\nProfiler summary:")
+        print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=12))
         print("\nTrace: reports/traces/inference_engine.json")
 
     print("\nFinal requests:")

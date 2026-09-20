@@ -5,7 +5,6 @@ import os
 
 import torch
 import torch.distributed as dist
-from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 
 from nano_llm_infra.models.tiny_transformer import TinyMLP, TinyTransformerModel
 from nano_llm_infra.training.amp import AmpEngine
@@ -264,18 +263,11 @@ def run_zero(args: argparse.Namespace, device: torch.device, rank: int, world_si
 
     bench = Benchmark(device, args.warmup, args.steps)
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        profile_memory=True,
-        record_shapes=True,
-        on_trace_ready=tensorboard_trace_handler(f"./logs/zero{args.zero_stage}"),
-    ) as prof:
-        for step in range(bench.warmup + bench.steps):
-            if step == bench.warmup:
-                bench.begin()
-            with record_function("model_step"):
-                runtime.run_step(x)
-        bench.end()
+    for step in range(bench.warmup + bench.steps):
+        if step == bench.warmup:
+            bench.begin()
+        runtime.run_step(x)
+    bench.end()
 
     if rank == 0:
         print(

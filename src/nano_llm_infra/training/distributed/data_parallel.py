@@ -93,7 +93,12 @@ class GradientReducer:
             torch.cuda.current_stream(self.device).record_event(ready_event)
             with torch.cuda.stream(self.comm_stream):
                 self.comm_stream.wait_event(ready_event)
-                bucket.allreduce_handle = dist.all_reduce(bucket.buffer, group=self.group, async_op=True) #这里只是求和
+                with torch.cuda.nvtx.range(f"bucket_{bucket_index}_allreduce"):
+                    bucket.allreduce_handle = dist.all_reduce(
+                        bucket.buffer,
+                        group=self.group,
+                        async_op=True,
+                    )
                 bucket.done_event = torch.cuda.Event()
                 bucket.done_event.record(self.comm_stream)
             self.timeline.append(f"bucket {bucket_index}: async all_reduce launched")
@@ -139,21 +144,24 @@ class DataParallelRuntime:
         if self.gradient_reducer is not None:
             self.gradient_reducer.begin_backward()
 
-        with self.amp.autocast():
-            # 前向
-            logits = self.model(token_ids)
-            loss = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                token_ids[:, 1:].reshape(-1),
-            )
+        with torch.cuda.nvtx.range("dp_forward"):
+            with self.amp.autocast():
+                logits = self.model(token_ids)
+                loss = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                    token_ids[:, 1:].reshape(-1),
+                )
 
         # 开始反向，本卡局部梯度写进param.grad之后触发hook函数
-        self.amp.backward(loss)
+        with torch.cuda.nvtx.range("dp_backward"):
+            self.amp.backward(loss)
         #  wait 通信、把梯度除以 world_size（求平均），再写回 param.grad
         if self.gradient_reducer is not None:
-            self.gradient_reducer.finish_gradient_sync()
+            with torch.cuda.nvtx.range("grad_sync_wait"):
+                self.gradient_reducer.finish_gradient_sync()
         # 更新
-        self.amp.step(self.optimizer)
+        with torch.cuda.nvtx.range("optimizer_step"):
+            self.amp.step(self.optimizer)
         return loss.detach()
 
     def close(self) -> None:
