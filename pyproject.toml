@@ -5,15 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ray>=2.40",
     "torch==2.11.0+cu129",
     "torchvision==0.26.0+cu129",
     "torchaudio==2.11.0+cu129",
     "triton==3.6.0"
-]
-
-[project.optional-dependencies]
-rl = [
-    "ray>=2.40",
 ]
 
 [tool.uv.sources]

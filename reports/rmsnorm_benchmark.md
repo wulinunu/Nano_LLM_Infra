@@ -1,13 +1,5 @@
 # RMSNorm Benchmark 报告
 
-## 测试环境
-
-- 日期：2026-06-24
-- GPU：NVIDIA GeForce RTX 5060 Laptop GPU
-- CUDA Compute Capability：12.0
-- Benchmark 脚本：`benchmarks/bench_rmsnorm.py`
-- 运行命令：
-
 ```bash
 PYTHONPATH=src python benchmarks/bench_rmsnorm.py
 ```
@@ -49,7 +41,7 @@ PYTHONPATH=src python benchmarks/bench_rmsnorm.py
 
 ## 结论
 
-这次结果说明 Python 到 PyBind，再到自定义 CUDA kernel 的完整调用链路已经跑通。两个 CUDA 版本的最大误差都是 `1.907349e-06`，在当前 `float32` 测试下可以接受。
+两个 CUDA 版本的最大误差都是 `1.907349e-06`，可以接受。
 
 主要加速来自把 RMSNorm 融合成单个 CUDA kernel，避免 PyTorch reference 中多个 tensor operation 带来的额外 kernel launch 和中间张量读写。`warp shuffle` 版本比 `shared memory` 版本略快，因为它在 warp 内使用寄存器级 shuffle 做规约，减少了 shared memory 访问和同步开销。
 
@@ -66,10 +58,6 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src /usr/local/cuda/bin/ncu --set full --nvtx 
   -o reports/ncu_rmsnorm -f \
   python evals/bench_rmsnorm.py --ncu-profile
 ```
-
-原始 `.ncu-rep` 文件体积较大，不提交到仓库；报告只保留可复现命令和关键指标。
-
-若出现 `ERR_NVGPUCTRPERM`，需要宿主机管理员开启 NVIDIA Performance Counter 权限；容器内 root 用户无法绕过宿主机驱动限制。
 
 ### Duration
 

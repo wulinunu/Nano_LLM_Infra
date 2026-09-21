@@ -14,12 +14,13 @@ from nano_llm_infra.models.tiny_transformer import TinyTransformerModel
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--num-blocks", type=int, default=2)
     args = parser.parse_args()
 
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
     block_size = 4
-    allocator = BlockAllocator(num_blocks=2)
+    allocator = BlockAllocator(num_blocks=args.num_blocks)
     scheduler = IterationLevelScheduler(allocator=allocator, max_batch_size=2)
     model_runner = TinyTransformerModel(
         vocab_size=32,
